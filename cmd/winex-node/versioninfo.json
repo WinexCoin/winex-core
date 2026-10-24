@@ -1,0 +1,40 @@
+{
+	"FixedFileInfo": {
+		"FileVersion": {
+			"Major": 3,
+			"Minor": 6,
+			"Patch": 0,
+			"Build": 0
+		},
+		"ProductVersion": {
+			"Major": 3,
+			"Minor": 6,
+			"Patch": 0,
+			"Build": 0
+		},
+		"FileFlagsMask": "3f",
+		"FileFlags ": "00",
+		"FileOS": "040004",
+		"FileType": "01",
+		"FileSubType": "00"
+	},
+	"StringFileInfo": {
+		"Comments": "WINEX Sovereign Full Node Network Engine",
+		"CompanyName": "WINEX Foundation",
+		"FileDescription": "WINEX Sovereign Full Node Engine",
+		"FileVersion": "3.6.0.0",
+		"InternalName": "WINEX_Node",
+		"LegalCopyright": "Copyright © 2026 WINEX Foundation. All rights reserved.",
+		"OriginalFilename": "WINEX_Node.exe",
+		"ProductName": "WINEX Core Platform",
+		"ProductVersion": "3.6.0.0"
+	},
+	"VarFileInfo": {
+		"Translation": {
+			"LangID": "0409",
+			"CharsetID": "04B0"
+		}
+	},
+	"IconPath": "../go-wallet/assets/favicon.ico",
+	"ManifestPath": ""
+}

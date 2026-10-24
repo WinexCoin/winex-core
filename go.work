@@ -1,0 +1,7 @@
+go 1.26.10
+
+use (
+	./cmd/winex-miner
+	./cmd/winex-node
+	./cmd/winex-wallet
+)

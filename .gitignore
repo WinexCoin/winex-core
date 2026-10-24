@@ -1,0 +1,54 @@
+# Binaries and executables
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.syso
+*.AppImage
+
+# Test & Debug binaries
+test_bin
+/bin/
+cmd/winex-node/winex-node*
+cmd/winex-wallet/winex-wallet*
+cmd/winex-miner/winex-miner*
+WINEX_Node*
+WINEX_Wallet*
+WINEX_Miner*
+WINEX_Setup*
+
+# Archives and Packages
+*.zip
+*.tar.gz
+*.7z
+
+# Go workspace and build cache
+.cache/
+build/
+bin/
+
+# WINEX local ledger state & vault files (Crucial: never commit local chain databases or vaults)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.dat
+vault*.json
+chain.state.json
+miner_address.txt
+wallet_config.json
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.spec
+
+# IDE & OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
