@@ -4,7 +4,7 @@
 
 | Parameter | Value | Description |
 | :--- | :--- | :--- |
-| **Max Cap** | **12,100,000 WNX** | 2,100,000 Genesis Reserve + 10,000,000 PoW Mining Pool |
+| **Max Cap** | **12,100,000 WNX** | Total lifetime supply ceiling |
 | **Target Block Interval** | **15.0 Minutes** (900s) | Calibrated for network propagation and low uncle rate |
 | **Initial Block Subsidy** | **40.0 WNX** | Distributed exclusively to valid PoW miners |
 | **Halving Schedule** | **125,000 Blocks** | Block subsidy halves every ~3.56 years |
@@ -18,7 +18,7 @@ The block reward function is deterministic based on block height $H$:
 $$\text{Epoch} = \left\lfloor \frac{H}{125000} \right\rfloor$$
 $$\text{Reward}(H) = \frac{40.0}{2^{\text{Epoch}}}$$
 
-When the total mined supply reaches the 10,000,000 WNX mining pool limit, block subsidies cease, and validator incentives transition entirely to transaction priority fees.
+When the lifetime supply reaches the 12,100,000 WNX limit, block subsidies cease, and validator incentives transition entirely to transaction priority fees.
 
 ## 3. Proof-of-Work Consensus Verification
 

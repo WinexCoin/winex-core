@@ -2373,8 +2373,8 @@ Type 'help' for available commands.
 Protocol: WINEX (WNX) Sovereign Layer-1 Proof-of-Work
 Consensus Algorithm: Dual-Pass SHA-256 Mining Hash Engine
 Block Reward: 40.0000 WNX (Halving every 125,000 blocks)
-Finite Mineable Supply: 10,000,000.0000 WNX
-Genesis Developer Reserve: 2,100,000.0000 WNX (BIP-39 Vault)
+Finite Lifetime Supply: 12,100,000.0000 WNX (Deflationary Hard Cap)
+Halving Epoch Interval: 125,000 Blocks
 Transaction Fees: 0.0000 WNX Zero Protocol Fee
 Key Derivation: SECP256k1 + RFC 6979 Deterministic Signatures
 Cold Storage: AES-256-GCM Password Encrypted Local Keystore

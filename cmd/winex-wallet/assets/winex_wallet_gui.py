@@ -3005,7 +3005,7 @@ class WinexWalletApp(QMainWindow):
         if "blocks" in data and hasattr(self, 'recent_table'):
             raw_blocks = data["blocks"]
             if isinstance(raw_blocks, list):
-                # Never show Block #0 (Genesis Dev Reserve) on the public History ledger
+                # Never show Block #0 (Network Reserve) on the public History ledger
                 filtered_blocks = [
                     b for b in raw_blocks
                     if isinstance(b, dict) and b.get("block_index", b.get("index", 0)) != 0
