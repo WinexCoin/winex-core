@@ -11,7 +11,7 @@
 
 ## Key Highlights
 
-- **Strict Supply Hard Cap:** Mathematically enforced maximum lifetime supply of **12,100,000 WNX**.
+- **Deterministic Issuance:** Predictable mathematical block subsidy emission governed entirely by consensus code.
 - **Predictable Halving Protocol:** Block rewards begin at **40.0 WNX** and halve every **125,000 blocks** (~3.56 years).
 - **Sub-Satoshi Divisibility:** Minimal transfer granularity down to **0.00000001 WNX** (8 decimal places).
 - **Deterministic Salted PoW:** Double-pass SHA-256 with address-bound salting and dynamic Emergency Difficulty Adjustment (EDA).
@@ -96,7 +96,6 @@ flowchart TD
 | **Target Block Interval** | 15.0 Minutes (900 seconds) |
 | **Initial Block Reward** | 40.0 WNX |
 | **Halving Schedule** | Every 125,000 blocks (~3.56 years) |
-| **Maximum Lifetime Supply** | **12,100,000 WNX** (Strict Hard Cap) |
 | **Minimum Transfer Unit** | **0.00000001 WNX** (8 decimal places) |
 | **Reorganization Guard** | Max Reorg Depth: 10 blocks |
 

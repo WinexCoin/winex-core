@@ -1466,7 +1466,7 @@ func main() {
 			output = `WINEX Interactive CLI Console v2.5
 Available Commands:
   help                                  Show this command reference
-  getinfo                               Query live node state, height, and 10,000,000 WNX pool
+  getinfo                               Query live node state, height, and network stats
   balance                               Inspect confirmed wallet balance
   address                               Display active receiving WNX address
   pubkey                                Display SECP256k1 uncompressed public key
@@ -2344,7 +2344,7 @@ Type 'help' for available commands.
         <div>&bull; Gateway Node: <span style="color:#fff;" id="netGateway">https://winexcoin.com (:8081)</span></div>
         <div>&bull; Synchronized Height: <span style="color:var(--accent-cyan);" id="netHeight">#38</span></div>
         <div>&bull; Block Subsidy: <span style="color:var(--accent-green);" id="netReward">40.0000 WNX</span></div>
-        <div>&bull; Unmined Pool Remaining: <span style="color:#fff;" id="netPool">10,000,000.00 WNX</span></div>
+        <div>&bull; Network Protocol: <span style="color:#fff;" id="netProto">WINEX Mainnet</span></div>
         <div>&bull; Network Continuity: <span style="color:var(--accent-green);">Immortal P2P Mesh (1+ Active Nodes)</span></div>
       </div>
     </div>
@@ -2373,7 +2373,6 @@ Type 'help' for available commands.
 Protocol: WINEX (WNX) Sovereign Layer-1 Proof-of-Work
 Consensus Algorithm: Dual-Pass SHA-256 Mining Hash Engine
 Block Reward: 40.0000 WNX (Halving every 125,000 blocks)
-Finite Lifetime Supply: 12,100,000.0000 WNX (Deflationary Hard Cap)
 Halving Epoch Interval: 125,000 Blocks
 Transaction Fees: 0.0000 WNX Zero Protocol Fee
 Key Derivation: SECP256k1 + RFC 6979 Deterministic Signatures
