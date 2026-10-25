@@ -1795,7 +1795,6 @@ class WinexWalletApp(QMainWindow):
         self.tab_widget.addTab(self.init_receive_page(), "Receive")
         self.tab_widget.addTab(self.init_addresses_page(), "Addresses")
         self.tab_widget.addTab(self.init_console_page(), "Console")
-        self.tab_widget.addTab(self.init_network_page(), "Network")
         self.tab_widget.addTab(self.init_settings_page(), "Preferences")
         self.tab_widget.addTab(self.init_about_page(), "Specification")
 
