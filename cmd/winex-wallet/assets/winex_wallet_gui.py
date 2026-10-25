@@ -1930,8 +1930,8 @@ class WinexWalletApp(QMainWindow):
         btn_offline.setProperty("class", "btn-secondary")
         btn_offline.clicked.connect(self.open_cold_storage_dialog)
 
-        btn_review = QPushButton("Pay / Broadcast...")
-        btn_review.setProperty("class", "btn-primary")
+        btn_review = QPushButton("⚡ Send WINEX (Instant 1-Click)")
+        btn_review.setStyleSheet("background-color: #22c55e; color: #000000; font-weight: 700; font-size: 13px; padding: 8px 18px; border-radius: 4px;")
         btn_review.clicked.connect(self.start_two_stage_send)
 
         act_bar.addStretch()
@@ -1996,7 +1996,7 @@ class WinexWalletApp(QMainWindow):
         fee = 0.0
 
         if not validate_address_format(recip):
-            QMessageBox.warning(self, "Invalid Address", "Please enter a valid WINEX address starting with WNX.")
+            QMessageBox.warning(self, "Invalid Address", "Please enter a valid WINEX address starting with WNX followed by 32 hex characters.")
             return
 
         if not self.wallet_data:
@@ -2006,18 +2006,45 @@ class WinexWalletApp(QMainWindow):
         send_acc = self.get_selected_send_account()
         cur_bal = float(send_acc.get("balance", self.wallet_data.get("balance", 0.0)))
         if amt > cur_bal:
-            QMessageBox.warning(self, "Insufficient Balance", f"Amount ({amt:.4f} WNX) exceeds selected address balance ({cur_bal:,.4f} WNX).")
+            # Auto-detect if another account in this wallet has sufficient balance
+            switched = False
+            for acc in self.wallet_data.get("accounts", []):
+                if float(acc.get("balance", 0.0)) >= amt and acc.get("address") != recip:
+                    sel_addr = acc.get("address")
+                    for i in range(self.send_from_combo.count()):
+                        if self.send_from_combo.itemData(i) == sel_addr:
+                            self.send_from_combo.setCurrentIndex(i)
+                            send_acc = acc
+                            cur_bal = float(acc.get("balance", 0.0))
+                            switched = True
+                            break
+                    if switched:
+                        break
+            if amt > cur_bal:
+                QMessageBox.warning(self, "Insufficient Balance", f"Amount ({amt:,.4f} WNX) exceeds account balance ({cur_bal:,.4f} WNX).")
+                return
+
+        if send_acc.get("address") == recip:
+            QMessageBox.warning(self, "Invalid Transfer", "Cannot send transaction to the same account.")
             return
 
         bal_after = cur_bal - amt
 
-        dlg = TwoStageConfirmDialog(recip, amt, fee, bal_after, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            pwd = dlg.get_password()
-            self.execute_signed_transaction(recip, amt, fee, pwd)
+        # True 1-Click Instant Send: if wallet already unlocked with password, send directly!
+        pwd = getattr(self, 'unlocked_password', '')
+        if not pwd:
+            dlg = TwoStageConfirmDialog(recip, amt, fee, bal_after, self)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                pwd = dlg.get_password()
+            else:
+                return
+
+        self.execute_signed_transaction(recip, amt, fee, pwd)
 
     def execute_signed_transaction(self, recip: str, amt: float, fee: float, password: str):
         try:
+            if not password and getattr(self, 'unlocked_password', ''):
+                password = self.unlocked_password
             enc = load_encrypted_wallet_dict()
             decrypted = decrypt_wallet_data(enc, password)
             send_acc = self.get_selected_send_account()
@@ -2031,8 +2058,8 @@ class WinexWalletApp(QMainWindow):
                     pub_hex = acc["public_key"]
                     sender_addr = acc["address"]
                     break
-        except Exception:
-            QMessageBox.critical(self, "Authentication Failed", "Incorrect wallet password. Transaction canceled.")
+        except Exception as e:
+            QMessageBox.critical(self, "Authentication Failed", f"Signing failed: {e}")
             return
 
         ts = time.time()
