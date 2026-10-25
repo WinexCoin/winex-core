@@ -2550,7 +2550,6 @@ function renderHistoryTable(blocks) {
     if (idx === 0) return; // Skip Block #0
     let miner = (b.miner || '').trim();
     if (!miner) miner = 'WNX8D4B5CED15F50A144899A8B3551C8CD4';
-    const shortMiner = miner.length > 16 ? miner.substring(0, 14) + '...' : miner;
     let reward = b.reward;
     if (!reward || reward <= 0) reward = 40.0;
 
@@ -2562,7 +2561,11 @@ function renderHistoryTable(blocks) {
 
     html += '<tr>' +
       '<td class="cell-state">Mined</td>' +
-      '<td class="cell-ref">Block #' + idx + ' mined by ' + shortMiner + '</td>' +
+      '<td class="cell-ref">' +
+        'Block #' + idx + ' &bull; ' +
+        '<span onclick="copyAddrText(\'' + miner + '\')" style="font-family:\'JetBrains Mono\', monospace; font-size:12px; color:var(--accent-primary); font-weight:600; cursor:pointer;" title="Click to copy address">' + miner + '</span>' +
+        '<button onclick="copyAddrText(\'' + miner + '\')" class="btn-pri" style="padding:1px 7px; font-size:11px; margin-left:8px; background:#1e2536; border:1px solid var(--border-strong); cursor:pointer;">Copy</button>' +
+      '</td>' +
       '<td class="cell-value">+' + reward.toFixed(4) + ' WNX</td>' +
       '<td class="cell-time">' + timeStr + '</td>' +
       '</tr>';
