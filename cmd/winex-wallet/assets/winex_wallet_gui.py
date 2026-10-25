@@ -36,11 +36,11 @@ from PySide6.QtCore import Qt, QTimer, QThread, Signal, QEvent, QSize
 from PySide6.QtGui import QFont, QPixmap, QColor, QIcon, QImage, QPainter, QAction
 
 # ==================== CONSTANTS & PATHS ====================
-DEFAULT_NODE = "http://127.0.0.1:8081"
+DEFAULT_NODE = "https://winexcoin.com"
 BOOTSTRAP_NODES = [
-    "http://127.0.0.1:8081",
-    "http://127.0.0.1:8080",
-    "https://winexcoin.com"
+    "https://winexcoin.com",
+    "http://130.61.60.162:8081",
+    "http://127.0.0.1:8081"
 ]
 WALLET_DIR = os.path.expanduser("~/.winex")
 WALLET_FILE = os.path.join(WALLET_DIR, "wallet.dat")
