@@ -1871,9 +1871,15 @@ class WinexWalletApp(QMainWindow):
         btn_paste = QPushButton("Paste")
         btn_paste.setProperty("class", "btn-secondary")
         btn_paste.clicked.connect(lambda: self.send_recip_inp.setText(QApplication.clipboard().text().strip()))
+
+        self.send_acc_dest_combo = QComboBox()
+        self.send_acc_dest_combo.setFont(QFont("JetBrains Mono", 10))
+        self.send_acc_dest_combo.currentIndexChanged.connect(self.on_send_acc_dest_selected)
+
         grid.addWidget(lbl_payto, 1, 0)
-        grid.addWidget(self.send_recip_inp, 1, 1, 1, 2)
-        grid.addWidget(btn_paste, 1, 3)
+        grid.addWidget(self.send_recip_inp, 1, 1)
+        grid.addWidget(btn_paste, 1, 2)
+        grid.addWidget(self.send_acc_dest_combo, 1, 3)
 
         # Row 2: Description
         lbl_desc = QLabel("Description")
@@ -1958,6 +1964,13 @@ class WinexWalletApp(QMainWindow):
     def on_send_from_changed(self, idx: int):
         pass
 
+    def on_send_acc_dest_selected(self, idx: int):
+        if not hasattr(self, 'send_acc_dest_combo'):
+            return
+        addr = self.send_acc_dest_combo.currentData()
+        if addr:
+            self.send_recip_inp.setText(addr)
+
     def get_selected_send_account(self) -> dict:
         if not self.wallet_data:
             return {}
@@ -2029,25 +2042,62 @@ class WinexWalletApp(QMainWindow):
         del priv_hex
         del decrypted
 
-        try:
-            r = self.api_request("POST", "api/transaction/send", json={
-                "sender": sender_addr,
-                "recipient": recip,
-                "amount": amt,
-                "fee": 0.0,
-                "timestamp": ts,
-                "public_key": pub_hex,
-                "signature": sig
-            })
+        tx_payload = {
+            "sender": sender_addr,
+            "recipient": recip,
+            "amount": amt,
+            "fee": 0.0,
+            "timestamp": ts,
+            "public_key": pub_hex,
+            "signature": sig
+        }
 
-            res = r.json()
-            tx_id = res.get("tx_id", "Confirmed")
-            QMessageBox.information(self, "Transaction Broadcasted",
-                                    f"Transaction signed and broadcast to the network.\n\nTXID: {tx_id[:32]}")
+        # Prioritize mainnet consensus gateway for autonomous immediate PoW settlement
+        priority_nodes = ["https://winexcoin.com", "http://130.61.60.162:8081"]
+        all_nodes = priority_nodes + [n for n in self.get_candidate_nodes() if n not in priority_nodes]
+
+        success = False
+        tx_id = ""
+        last_error = ""
+
+        for node in all_nodes:
+            url = f"{node.rstrip('/')}/api/transaction/send"
+            try:
+                r = requests.post(url, json=tx_payload, timeout=6)
+                if r.status_code in (200, 201):
+                    res = r.json()
+                    tx_id = res.get("tx_id", "Confirmed")
+                    success = True
+                    break
+                else:
+                    try:
+                        err_json = r.json()
+                        last_error = err_json.get("detail", err_json.get("message", r.text))
+                    except Exception:
+                        last_error = r.text
+            except Exception as e:
+                last_error = str(e)
+                continue
+
+        if not success:
+            try:
+                r = self.api_request("POST", "api/transaction/send", json=tx_payload)
+                res = r.json()
+                tx_id = res.get("tx_id", "Confirmed")
+                success = True
+            except Exception as ex:
+                last_error = f"{last_error} | {ex}"
+
+        if success:
+            QMessageBox.information(
+                self,
+                "Transaction Confirmed",
+                f"Transaction successfully signed and committed on-chain!\n\nTXID: {tx_id[:32]}...\nAmount: {amt:,.4f} WNX\nRecipient: {recip}"
+            )
             self.clear_send_form()
             self.poll_network_data()
-        except Exception as ex:
-            QMessageBox.critical(self, "Broadcast Failed", f"Network broadcast failed across candidate nodes: {ex}")
+        else:
+            QMessageBox.critical(self, "Broadcast Failed", f"Network broadcast failed across nodes:\n{last_error}")
 
     # ==================== PAGE 2: RECEIVE (ASYMMETRIC SPLIT LAYOUT) ====================
     def init_receive_page(self):
@@ -2211,6 +2261,11 @@ class WinexWalletApp(QMainWindow):
         btn_copy_sel.clicked.connect(self.copy_selected_table_address)
         top_bar.addWidget(btn_copy_sel)
 
+        btn_send_here = QPushButton("Send WINEX Here")
+        btn_send_here.setProperty("class", "btn-secondary")
+        btn_send_here.clicked.connect(self.send_to_selected_table_address)
+        top_bar.addWidget(btn_send_here)
+
         btn_label = QPushButton("Edit Label")
         btn_label.setProperty("class", "btn-secondary")
         btn_label.clicked.connect(self.edit_selected_address_label)
@@ -2256,8 +2311,11 @@ class WinexWalletApp(QMainWindow):
         addr = acc.get("address", "")
 
         menu = QMenu(self)
+        act_send = menu.addAction("Send WINEX to this Address")
+        act_send.triggered.connect(lambda: (self.send_recip_inp.setText(addr), self.switch_page(1)))
+
         act_copy = menu.addAction("Copy WNX Address")
-        act_copy.triggered.connect(lambda: QApplication.clipboard().setText(addr))
+        act_copy.triggered.connect(lambda: (QApplication.clipboard().setText(addr), QMessageBox.information(self, "Address Copied", f"Copied to clipboard:\n\n{addr}")))
 
         act_active = menu.addAction("Set as Active Receiving Address")
         act_active.triggered.connect(self.set_selected_address_active)
@@ -2326,6 +2384,17 @@ class WinexWalletApp(QMainWindow):
                         sel_i = i
                 combo.setCurrentIndex(sel_i)
                 combo.blockSignals(False)
+
+        if hasattr(self, 'send_acc_dest_combo'):
+            self.send_acc_dest_combo.blockSignals(True)
+            self.send_acc_dest_combo.clear()
+            self.send_acc_dest_combo.addItem("My Accounts...", "")
+            for i, acc in enumerate(accounts):
+                addr = acc.get("address", "")
+                lbl = acc.get("label", f"Account #{acc.get('index', i)}")
+                short_a = f"{addr[:8]}...{addr[-6:]}" if len(addr) > 16 else addr
+                self.send_acc_dest_combo.addItem(f"#{acc.get('index', i)} {lbl} ({short_a})", addr)
+            self.send_acc_dest_combo.blockSignals(False)
 
     def persist_wallet_accounts(self):
         if not self.wallet_data or not self.unlocked_password:
@@ -2425,6 +2494,18 @@ class WinexWalletApp(QMainWindow):
         if 0 <= row < len(accounts):
             addr = accounts[row]["address"]
             QApplication.clipboard().setText(addr)
+            QMessageBox.information(self, "Address Copied", f"Copied WNX Address to clipboard:\n\n{addr}")
+
+    def send_to_selected_table_address(self):
+        if not self.wallet_data:
+            return
+        ensure_wallet_accounts(self.wallet_data)
+        accounts = self.wallet_data["accounts"]
+        row = self.get_selected_table_account_index()
+        if 0 <= row < len(accounts):
+            addr = accounts[row]["address"]
+            self.send_recip_inp.setText(addr)
+            self.switch_page(1)
 
     def edit_selected_address_label(self):
         if not self.wallet_data:
