@@ -52,6 +52,47 @@ var embeddedFaviconIco []byte
 
 const defaultRemoteNode = "https://winexcoin.com"
 
+func writeWalletJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(data)
+}
+
+func writeWalletError(w http.ResponseWriter, status int, msg string) {
+	writeWalletJSON(w, status, map[string]interface{}{
+		"status":  "error",
+		"message": msg,
+		"detail":  msg,
+	})
+}
+
+func getConsensusNodes(preferred string) []string {
+	var nodes []string
+	p := strings.TrimRight(strings.TrimSpace(preferred), "/")
+	if p != "" {
+		nodes = append(nodes, p)
+	}
+	defaults := []string{
+		"https://winexcoin.com",
+		"http://130.61.60.162:8081",
+		"http://127.0.0.1:8081",
+	}
+	for _, d := range defaults {
+		found := false
+		for _, n := range nodes {
+			if n == d {
+				found = true
+				break
+			}
+		}
+		if !found {
+			nodes = append(nodes, d)
+		}
+	}
+	return nodes
+}
+
+
 type EncryptedVault struct {
 	Version   int    `json:"version"`
 	SaltHex   string `json:"salt"`
@@ -349,11 +390,9 @@ func discoverHDAccounts(mnemonic, nodeURL string) []HDAccount {
 	cleanSeed := strings.TrimSpace(mnemonic)
 	acc0 := deriveHDAccount(cleanSeed, 0, "Primary Account")
 	accounts := []HDAccount{acc0}
-	if nodeURL == "" {
-		nodeURL = defaultRemoteNode
-	}
+	nodes := getConsensusNodes(nodeURL)
 
-	client := &http.Client{Timeout: 1800 * time.Millisecond}
+	client := &http.Client{Timeout: 2000 * time.Millisecond}
 
 	// Scan gap limit: check indices 1..20 for any balance or history
 	highestActive := 0
@@ -366,15 +405,19 @@ func discoverHDAccounts(mnemonic, nodeURL string) []HDAccount {
 	for i := 1; i <= 20; i++ {
 		candidate := deriveHDAccount(cleanSeed, i, fmt.Sprintf("Account #%d", i))
 		var bVal float64 = 0.0
-		resp, err := client.Get(fmt.Sprintf("%s/api/balance/%s", nodeURL, candidate.Address))
-		if err == nil {
-			var bMap map[string]interface{}
-			if err := json.NewDecoder(resp.Body).Decode(&bMap); err == nil {
-				if v, ok := bMap["balance"].(float64); ok {
-					bVal = v
+		for _, nd := range nodes {
+			resp, err := client.Get(fmt.Sprintf("%s/api/balance/%s", nd, candidate.Address))
+			if err == nil && resp.StatusCode == 200 {
+				var bMap map[string]interface{}
+				if err := json.NewDecoder(resp.Body).Decode(&bMap); err == nil {
+					if v, ok := bMap["balance"].(float64); ok {
+						bVal = v
+						resp.Body.Close()
+						break
+					}
 				}
+				resp.Body.Close()
 			}
-			resp.Body.Close()
 		}
 		candidate.Balance = bVal
 		if bVal > 0 {
@@ -1005,39 +1048,50 @@ func main() {
 		currActiveAddr := activeVault.Address
 		vaultLock.Unlock()
 
+		candidateNodes := getConsensusNodes(curW.NodeURL)
 		for i := range accountsCopy {
 			addr := accountsCopy[i].Address
 			accountsCopy[i].PrivateKey = "" // Redact private key from JSON API responses
 			var aBal float64 = 0.0
-			resp, err := client.Get(curW.NodeURL + "/api/balance/" + addr)
-			if err == nil {
-				nodeOnline = true
-				var bMap map[string]interface{}
-				if err := json.NewDecoder(resp.Body).Decode(&bMap); err == nil {
-					if v, ok := bMap["balance"].(float64); ok {
-						aBal = v
+			for _, nd := range candidateNodes {
+				resp, err := client.Get(nd + "/api/balance/" + addr)
+				if err == nil && resp.StatusCode == 200 {
+					nodeOnline = true
+					var bMap map[string]interface{}
+					if err := json.NewDecoder(resp.Body).Decode(&bMap); err == nil {
+						if v, ok := bMap["balance"].(float64); ok {
+							aBal = v
+							resp.Body.Close()
+							break
+						}
 					}
+					resp.Body.Close()
 				}
-				resp.Body.Close()
 			}
 			accountsCopy[i].Balance = aBal
 			accountsCopy[i].IsActive = (addr == currActiveAddr)
 			totalBal += aBal
 		}
 
-		respState, err2 := client.Get(curW.NodeURL + "/api/state")
-		if err2 == nil {
-			var sMap map[string]interface{}
-			_ = json.NewDecoder(respState.Body).Decode(&sMap)
-			respState.Body.Close()
-			if h, ok := sMap["block_height"].(float64); ok {
-				height = int64(h)
-			}
-			if p, ok := sMap["pool_remaining"].(float64); ok {
-				poolRem = p
-			}
-			if r, ok := sMap["block_reward"].(float64); ok {
-				blkReward = r
+		for _, nd := range candidateNodes {
+			respState, err2 := client.Get(nd + "/api/state")
+			if err2 == nil && respState.StatusCode == 200 {
+				nodeOnline = true
+				var sMap map[string]interface{}
+				if err := json.NewDecoder(respState.Body).Decode(&sMap); err == nil {
+					if h, ok := sMap["block_height"].(float64); ok {
+						height = int64(h)
+					}
+					if p, ok := sMap["pool_remaining"].(float64); ok {
+						poolRem = p
+					}
+					if r, ok := sMap["block_reward"].(float64); ok {
+						blkReward = r
+					}
+					respState.Body.Close()
+					break
+				}
+				respState.Body.Close()
 			}
 		}
 
@@ -1268,7 +1322,7 @@ func main() {
 		vaultLock.Unlock()
 
 		if curW == nil {
-			http.Error(w, "Wallet is locked", 401)
+			writeWalletError(w, 401, "Wallet is locked")
 			return
 		}
 
@@ -1278,18 +1332,18 @@ func main() {
 			Amount      float64 `json:"amount"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), 400)
+			writeWalletError(w, 400, "Invalid JSON payload: "+err.Error())
 			return
 		}
 
 		req.Recipient = strings.TrimSpace(req.Recipient)
 		req.FromAddress = strings.TrimSpace(req.FromAddress)
 		if math.IsNaN(req.Amount) || math.IsInf(req.Amount, 0) || req.Amount < 0.00000001 || req.Amount > 10000000.0 {
-			http.Error(w, "Invalid amount parameter (min 0.00000001 WNX)", 400)
+			writeWalletError(w, 400, "Invalid amount parameter (min 0.00000001 WNX)")
 			return
 		}
 		if !strings.HasPrefix(req.Recipient, "WNX") || len(req.Recipient) < 20 || len(req.Recipient) > 42 {
-			http.Error(w, "Invalid recipient address format", 400)
+			writeWalletError(w, 400, "Invalid recipient address format (Must start with WNX)")
 			return
 		}
 
@@ -1316,7 +1370,7 @@ func main() {
 		}
 		if sourceAcc == nil {
 			vaultLock.Unlock()
-			http.Error(w, "No active spending account found", 400)
+			writeWalletError(w, 400, "No active spending account found")
 			return
 		}
 
@@ -1326,28 +1380,35 @@ func main() {
 		vaultLock.Unlock()
 
 		if req.Recipient == senderAddr {
-			http.Error(w, "Cannot transfer funds to the same address", 400)
+			writeWalletError(w, 400, "Cannot transfer funds to the same address")
 			return
 		}
 
-		// Retrieve server network time to protect against client/VM clock skew
 		client := &http.Client{Timeout: 5 * time.Second}
+		candidateNodes := getConsensusNodes(curW.NodeURL)
+
+		// 1. Retrieve server network time to protect against client/VM clock skew
 		var ts float64 = float64(time.Now().UnixNano()) / 1e9
-		tmplResp, errTmpl := client.Get(curW.NodeURL + "/api/mining/template")
-		if errTmpl == nil {
-			var tMap map[string]interface{}
-			if err := json.NewDecoder(tmplResp.Body).Decode(&tMap); err == nil {
-				if st, ok := tMap["server_time"].(float64); ok && st > 0 {
-					ts = st
+		for _, nd := range candidateNodes {
+			tmplResp, errTmpl := client.Get(nd + "/api/mining/template")
+			if errTmpl == nil && tmplResp.StatusCode == 200 {
+				var tMap map[string]interface{}
+				if err := json.NewDecoder(tmplResp.Body).Decode(&tMap); err == nil {
+					if st, ok := tMap["server_time"].(float64); ok && st > 0 {
+						ts = st
+						tmplResp.Body.Close()
+						break
+					}
 				}
+				tmplResp.Body.Close()
 			}
-			tmplResp.Body.Close()
 		}
 
+		// 2. Sign transaction data cryptographically
 		rawMsg := fmt.Sprintf("%s:%s:%.8f:%.8f:%.4f", senderAddr, req.Recipient, req.Amount, 0.0, ts)
 		sig, err := signTransactionData(senderPrivKey, rawMsg)
 		if err != nil {
-			http.Error(w, "Signing error: "+err.Error(), 500)
+			writeWalletError(w, 500, "Signing error: "+err.Error())
 			return
 		}
 
@@ -1362,15 +1423,46 @@ func main() {
 		}
 
 		pBytes, _ := json.Marshal(payload)
-		resp, err := client.Post(curW.NodeURL+"/api/transaction/send", "application/json", bytes.NewBuffer(pBytes))
-		if err != nil {
-			http.Error(w, "Unable to reach network nodes: "+err.Error(), 502)
+
+		// 3. Multi-node broadcast failover
+		var lastErr string = "Unable to reach network nodes"
+		var successResp []byte = nil
+		var successStatus int = 200
+
+		for _, nd := range candidateNodes {
+			postResp, postErr := client.Post(nd+"/api/transaction/send", "application/json", bytes.NewBuffer(pBytes))
+			if postErr != nil {
+				continue
+			}
+			body, _ := io.ReadAll(postResp.Body)
+			postResp.Body.Close()
+
+			if postResp.StatusCode >= 200 && postResp.StatusCode < 300 {
+				successResp = body
+				successStatus = postResp.StatusCode
+				break
+			} else {
+				var rMap map[string]interface{}
+				if json.Unmarshal(body, &rMap) == nil {
+					if d, ok := rMap["detail"].(string); ok && d != "" {
+						lastErr = d
+					} else if m, ok := rMap["message"].(string); ok && m != "" {
+						lastErr = m
+					}
+				} else if len(body) > 0 && len(body) < 250 {
+					lastErr = string(body)
+				}
+			}
+		}
+
+		if successResp != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(successStatus)
+			w.Write(successResp)
 			return
 		}
-		defer resp.Body.Close()
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
+
+		writeWalletError(w, 400, lastErr)
 	})
 
 	// Sign Arbitrary Message
@@ -1466,7 +1558,7 @@ func main() {
 			output = `WINEX Interactive CLI Console v2.5
 Available Commands:
   help                                  Show this command reference
-  getinfo                               Query live node state, height, and network stats
+  getinfo                               Query live node state, height, and 10,000,000 WNX pool
   balance                               Inspect confirmed wallet balance
   address                               Display active receiving WNX address
   pubkey                                Display SECP256k1 uncompressed public key
@@ -2344,7 +2436,7 @@ Type 'help' for available commands.
         <div>&bull; Gateway Node: <span style="color:#fff;" id="netGateway">https://winexcoin.com (:8081)</span></div>
         <div>&bull; Synchronized Height: <span style="color:var(--accent-cyan);" id="netHeight">#38</span></div>
         <div>&bull; Block Subsidy: <span style="color:var(--accent-green);" id="netReward">40.0000 WNX</span></div>
-        <div>&bull; Network Protocol: <span style="color:#fff;" id="netProto">WINEX Mainnet</span></div>
+        <div>&bull; Unmined Pool Remaining: <span style="color:#fff;" id="netPool">10,000,000.00 WNX</span></div>
         <div>&bull; Network Continuity: <span style="color:var(--accent-green);">Immortal P2P Mesh (1+ Active Nodes)</span></div>
       </div>
     </div>
@@ -2373,6 +2465,7 @@ Type 'help' for available commands.
 Protocol: WINEX (WNX) Sovereign Layer-1 Proof-of-Work
 Consensus Algorithm: Dual-Pass SHA-256 Mining Hash Engine
 Block Reward: 40.0000 WNX (Halving every 125,000 blocks)
+Finite Lifetime Supply: 12,100,000.0000 WNX (Deflationary Hard Cap)
 Halving Epoch Interval: 125,000 Blocks
 Transaction Fees: 0.0000 WNX Zero Protocol Fee
 Key Derivation: SECP256k1 + RFC 6979 Deterministic Signatures
@@ -2600,6 +2693,9 @@ function populateSendAccounts(accounts, activeAddr) {
   if (!sel || !accounts || !Array.isArray(accounts)) return;
   const currentVal = sel.value;
   sel.innerHTML = '';
+
+  const fundedAcc = accounts.find(a => (a.balance || 0) > 0);
+
   accounts.forEach(acc => {
     const opt = document.createElement('option');
     opt.value = acc.address;
@@ -2608,7 +2704,9 @@ function populateSendAccounts(accounts, activeAddr) {
     opt.innerText = '#' + acc.index + ' ' + (acc.label || ('Account #' + acc.index)) + ' [' + shortAddr + '] — ' + Number(acc.balance || 0).toFixed(4) + ' WNX';
     if (currentVal && opt.value === currentVal) {
       opt.selected = true;
-    } else if (!currentVal && acc.address === activeAddr) {
+    } else if (!currentVal && fundedAcc && acc.address === fundedAcc.address) {
+      opt.selected = true;
+    } else if (!currentVal && !fundedAcc && acc.address === activeAddr) {
       opt.selected = true;
     }
     sel.appendChild(opt);
@@ -2623,6 +2721,11 @@ function updateSendAccountBal() {
   const opt = sel.options[sel.selectedIndex];
   const bal = opt ? parseFloat(opt.dataset.balance || 0) : 0;
   lbl.innerText = 'Available: ' + bal.toFixed(4) + ' WNX (Use Max)';
+  if (bal > 0) {
+    lbl.style.color = "var(--accent-green)";
+  } else {
+    lbl.style.color = "var(--accent-danger)";
+  }
 }
 
 function setSendMaxAmount() {
@@ -2646,13 +2749,26 @@ async function doSendTransaction() {
     out.style.color = "var(--accent-danger)";
     return;
   }
+  if (!recip.startsWith("WNX") || recip.length < 20) {
+    out.innerText = "Error: Invalid recipient address format (Must start with WNX).";
+    out.style.color = "var(--accent-danger)";
+    return;
+  }
   if (isNaN(amt) || amt <= 0) {
-    out.innerText = "Error: Please enter a valid transfer amount.";
+    out.innerText = "Error: Please enter a valid transfer amount (min 0.00000001 WNX).";
     out.style.color = "var(--accent-danger)";
     return;
   }
 
-  out.innerText = "Signing & broadcasting across P2P mesh...";
+  const opt = sel ? sel.options[sel.selectedIndex] : null;
+  const availBal = opt ? parseFloat(opt.dataset.balance || 0) : 0;
+  if (amt > availBal) {
+    out.innerText = "Insufficient balance in selected account. Available: " + availBal.toFixed(4) + " WNX, Required: " + amt.toFixed(4) + " WNX. Please choose an account with sufficient balance.";
+    out.style.color = "var(--accent-danger)";
+    return;
+  }
+
+  out.innerText = "Signing & broadcasting across P2P consensus mesh...";
   out.style.color = "var(--text-main)";
 
   try {
@@ -2661,14 +2777,23 @@ async function doSendTransaction() {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({from_address: fromAddr, recipient: recip, amount: amt})
     });
-    const d = await res.json();
+    
+    let d = null;
+    const txt = await res.text();
+    try {
+      d = JSON.parse(txt);
+    } catch(err) {
+      d = { detail: txt };
+    }
+
     if (res.ok && (d.status === 'ok' || d.success || d.tx_id)) {
       out.innerText = "Transaction Broadcast Confirmed (0.0000 WNX Fee) • TXID: " + (d.tx_id || 'Accepted');
       out.style.color = "var(--accent-green)";
       document.getElementById('inpRecipient').value = '';
       refreshDashboard();
     } else {
-      out.innerText = "Rejected: " + (d.detail || d.message || JSON.stringify(d));
+      const errMsg = d.detail || d.message || d.error || JSON.stringify(d);
+      out.innerText = "Transaction Rejected: " + errMsg;
       out.style.color = "var(--accent-danger)";
     }
   } catch(e) {

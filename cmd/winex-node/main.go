@@ -36,6 +36,7 @@ const (
 
 var bootstrapNodes = []string{
 	"https://winexcoin.com",
+	"http://130.61.60.162:8081",
 }
 
 type Block struct {
@@ -512,6 +513,7 @@ func (n *NodeEngine) AddTransaction(sender, recip string, amount, fee float64, p
 		"timestamp":  ts,
 	})
 	client := &http.Client{Timeout: 3500 * time.Millisecond}
+	var relayErr string
 	for _, boot := range bootstrapNodes {
 		resp, err := client.Post(strings.TrimRight(boot, "/")+"/api/transaction/send", "application/json", bytes.NewReader(payloadBytes))
 		if err == nil {
@@ -524,8 +526,20 @@ func (n *NodeEngine) AddTransaction(sender, recip string, amount, fee float64, p
 						return true, txID
 					}
 				}
+			} else {
+				var rMap map[string]interface{}
+				if json.Unmarshal(body, &rMap) == nil {
+					if d, ok := rMap["detail"].(string); ok && d != "" {
+						relayErr = d
+					} else if m, ok := rMap["message"].(string); ok && m != "" {
+						relayErr = m
+					}
+				}
 			}
 		}
+	}
+	if relayErr != "" {
+		return false, relayErr
 	}
 
 	n.mu.Lock()
@@ -542,7 +556,13 @@ func (n *NodeEngine) AddTransaction(sender, recip string, amount, fee float64, p
 	senderBal := n.state.Balances[sender]
 	totalReq := amount + fee
 	if senderBal < totalReq {
-		return false, fmt.Sprintf("Insufficient balance: available %.4f WNX, required %.4f WNX", senderBal, totalReq)
+		freshBalMap := n.GetBalance(sender)
+		if fb, ok := freshBalMap["balance"].(float64); ok && fb >= totalReq {
+			senderBal = fb
+			n.state.Balances[sender] = fb
+		} else {
+			return false, fmt.Sprintf("Insufficient balance: available %.4f WNX, required %.4f WNX", senderBal, totalReq)
+		}
 	}
 
 	txidRaw := fmt.Sprintf("%s:%s:%.8f:%.8f:%.4f:%s", sender, recip, amount, fee, ts, sig)
