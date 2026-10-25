@@ -1451,6 +1451,40 @@ class NetworkPollerWorker(QThread):
         if result and self._running:
             self.data_received.emit(result)
 
+class TxBroadcastWorker(QThread):
+    finished_success = Signal(str, float, str)
+    finished_error = Signal(str)
+
+    def __init__(self, all_nodes: list, tx_payload: dict, amt: float, recip: str, parent=None):
+        super().__init__(parent)
+        self.all_nodes = list(all_nodes)
+        self.tx_payload = dict(tx_payload)
+        self.amt = amt
+        self.recip = recip
+
+    def run(self):
+        last_error = ""
+        for node in self.all_nodes:
+            url = f"{node.rstrip('/')}/api/transaction/send"
+            try:
+                r = requests.post(url, json=self.tx_payload, timeout=5)
+                if r.status_code in (200, 201):
+                    res = r.json()
+                    tx_id = res.get("tx_id", "Confirmed")
+                    self.finished_success.emit(tx_id, self.amt, self.recip)
+                    return
+                else:
+                    try:
+                        err_json = r.json()
+                        last_error = err_json.get("detail", err_json.get("message", r.text))
+                    except Exception:
+                        last_error = r.text
+            except Exception as e:
+                last_error = str(e)
+                continue
+
+        self.finished_error.emit(last_error or "Network broadcast failed across nodes")
+
 # ==================== MAIN WALLET GUI WINDOW ====================
 
 class WinexWalletApp(QMainWindow):
@@ -1930,14 +1964,14 @@ class WinexWalletApp(QMainWindow):
         btn_offline.setProperty("class", "btn-secondary")
         btn_offline.clicked.connect(self.open_cold_storage_dialog)
 
-        btn_review = QPushButton("⚡ Send WINEX (Instant 1-Click)")
-        btn_review.setStyleSheet("background-color: #22c55e; color: #000000; font-weight: 700; font-size: 13px; padding: 8px 18px; border-radius: 4px;")
-        btn_review.clicked.connect(self.start_two_stage_send)
+        self.btn_send_instant = QPushButton("Send")
+        self.btn_send_instant.setProperty("class", "btn-primary")
+        self.btn_send_instant.clicked.connect(self.start_two_stage_send)
 
         act_bar.addStretch()
         act_bar.addWidget(btn_clear)
         act_bar.addWidget(btn_offline)
-        act_bar.addWidget(btn_review)
+        act_bar.addWidget(self.btn_send_instant)
         l.addLayout(act_bar)
         l.addStretch()
         return page
@@ -2030,7 +2064,11 @@ class WinexWalletApp(QMainWindow):
 
         bal_after = cur_bal - amt
 
-        # True 1-Click Instant Send: if wallet already unlocked with password, send directly!
+        # True 1-Click Instant Send: if wallet is open, send immediately with zero dialogs!
+        if self.wallet_data and not getattr(self, 'is_locked', False):
+            self.execute_signed_transaction(recip, amt, fee, getattr(self, 'unlocked_password', ''))
+            return
+
         pwd = getattr(self, 'unlocked_password', '')
         if not pwd:
             dlg = TwoStageConfirmDialog(recip, amt, fee, bal_after, self)
@@ -2043,21 +2081,34 @@ class WinexWalletApp(QMainWindow):
 
     def execute_signed_transaction(self, recip: str, amt: float, fee: float, password: str):
         try:
-            if not password and getattr(self, 'unlocked_password', ''):
-                password = self.unlocked_password
-            enc = load_encrypted_wallet_dict()
-            decrypted = decrypt_wallet_data(enc, password)
+            priv_hex = ""
+            pub_hex = ""
+            sender_addr = ""
             send_acc = self.get_selected_send_account()
-            target_addr = send_acc.get("address", decrypted["address"])
-            priv_hex = decrypted["private_key"]
-            pub_hex = decrypted["public_key"]
-            sender_addr = decrypted["address"]
-            for acc in decrypted.get("accounts", []):
-                if acc.get("address") == target_addr:
-                    priv_hex = acc["private_key"]
-                    pub_hex = acc["public_key"]
-                    sender_addr = acc["address"]
-                    break
+            if send_acc and send_acc.get("private_key") and send_acc.get("public_key"):
+                priv_hex = send_acc["private_key"]
+                pub_hex = send_acc["public_key"]
+                sender_addr = send_acc.get("address", "")
+            elif self.wallet_data and self.wallet_data.get("private_key"):
+                priv_hex = self.wallet_data["private_key"]
+                pub_hex = self.wallet_data["public_key"]
+                sender_addr = self.wallet_data.get("address", "")
+
+            if not priv_hex or not pub_hex:
+                if not password and getattr(self, 'unlocked_password', ''):
+                    password = self.unlocked_password
+                enc = load_encrypted_wallet_dict()
+                decrypted = decrypt_wallet_data(enc, password)
+                target_addr = send_acc.get("address", decrypted["address"])
+                priv_hex = decrypted["private_key"]
+                pub_hex = decrypted["public_key"]
+                sender_addr = decrypted["address"]
+                for acc in decrypted.get("accounts", []):
+                    if acc.get("address") == target_addr:
+                        priv_hex = acc["private_key"]
+                        pub_hex = acc["public_key"]
+                        sender_addr = acc["address"]
+                        break
         except Exception as e:
             QMessageBox.critical(self, "Authentication Failed", f"Signing failed: {e}")
             return
@@ -2065,9 +2116,6 @@ class WinexWalletApp(QMainWindow):
         ts = time.time()
         tx_msg = f"{sender_addr}:{recip}:{amt:.4f}:{fee:.4f}:{ts:.4f}"
         sig = sign_transaction(priv_hex, tx_msg)
-
-        del priv_hex
-        del decrypted
 
         tx_payload = {
             "sender": sender_addr,
@@ -2079,52 +2127,37 @@ class WinexWalletApp(QMainWindow):
             "signature": sig
         }
 
-        # Prioritize mainnet consensus gateway for autonomous immediate PoW settlement
-        priority_nodes = ["https://winexcoin.com", "http://130.61.60.162:8081"]
+        # Mainnet consensus gateway prioritized for instant autonomous PoW settlement
+        priority_nodes = ["https://winexcoin.com", "http://127.0.0.1:8081"]
         all_nodes = priority_nodes + [n for n in self.get_candidate_nodes() if n not in priority_nodes]
 
-        success = False
-        tx_id = ""
-        last_error = ""
+        # Launch asynchronous background worker (never freezes the GUI window)
+        if hasattr(self, 'btn_send_instant'):
+            self.btn_send_instant.setEnabled(False)
+            self.btn_send_instant.setText("Sending...")
 
-        for node in all_nodes:
-            url = f"{node.rstrip('/')}/api/transaction/send"
-            try:
-                r = requests.post(url, json=tx_payload, timeout=6)
-                if r.status_code in (200, 201):
-                    res = r.json()
-                    tx_id = res.get("tx_id", "Confirmed")
-                    success = True
-                    break
-                else:
-                    try:
-                        err_json = r.json()
-                        last_error = err_json.get("detail", err_json.get("message", r.text))
-                    except Exception:
-                        last_error = r.text
-            except Exception as e:
-                last_error = str(e)
-                continue
+        self.tx_broadcast_worker = TxBroadcastWorker(all_nodes, tx_payload, amt, recip, self)
+        self.tx_broadcast_worker.finished_success.connect(self.on_tx_broadcast_success)
+        self.tx_broadcast_worker.finished_error.connect(self.on_tx_broadcast_error)
+        self.tx_broadcast_worker.start()
 
-        if not success:
-            try:
-                r = self.api_request("POST", "api/transaction/send", json=tx_payload)
-                res = r.json()
-                tx_id = res.get("tx_id", "Confirmed")
-                success = True
-            except Exception as ex:
-                last_error = f"{last_error} | {ex}"
+    def on_tx_broadcast_success(self, tx_id: str, amt: float, recip: str):
+        if hasattr(self, 'btn_send_instant'):
+            self.btn_send_instant.setEnabled(True)
+            self.btn_send_instant.setText("Send")
+        self.clear_send_form()
+        self.poll_network_data()
+        QMessageBox.information(
+            self,
+            "Transaction Confirmed",
+            f"Transaction successfully signed and committed on-chain!\n\nTXID: {tx_id[:32]}...\nAmount: {amt:,.4f} WNX\nRecipient: {recip}"
+        )
 
-        if success:
-            QMessageBox.information(
-                self,
-                "Transaction Confirmed",
-                f"Transaction successfully signed and committed on-chain!\n\nTXID: {tx_id[:32]}...\nAmount: {amt:,.4f} WNX\nRecipient: {recip}"
-            )
-            self.clear_send_form()
-            self.poll_network_data()
-        else:
-            QMessageBox.critical(self, "Broadcast Failed", f"Network broadcast failed across nodes:\n{last_error}")
+    def on_tx_broadcast_error(self, err: str):
+        if hasattr(self, 'btn_send_instant'):
+            self.btn_send_instant.setEnabled(True)
+            self.btn_send_instant.setText("Send")
+        QMessageBox.critical(self, "Broadcast Failed", f"Network broadcast failed across nodes:\n{err}")
 
     # ==================== PAGE 2: RECEIVE (ASYMMETRIC SPLIT LAYOUT) ====================
     def init_receive_page(self):
