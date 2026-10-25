@@ -609,69 +609,7 @@ class WinexBlockchain:
         except Exception:
             pass
 
-        # Trigger instant consensus settlement so transactions confirm immediately
-        try:
-            self.instant_settle_mempool()
-        except Exception:
-            pass
-
         return True, tx_id
-
-    def instant_settle_mempool(self):
-        """Autonomous Network Fast-Settlement: Commits pending mempool transactions to ledger immediately."""
-        with self.lock:
-            cur = self.conn.cursor()
-            cur.execute("SELECT * FROM mempool ORDER BY fee DESC, timestamp ASC LIMIT 50")
-            rows = cur.fetchall()
-            if not rows:
-                return
-
-            cur.execute("SELECT * FROM blocks ORDER BY block_index DESC LIMIT 1")
-            last = cur.fetchone()
-            if not last:
-                return
-            new_idx = last["block_index"] + 1
-            prev_hash = last["hash"]
-            now = time.time()
-
-            tx_list = []
-            committed_tx_ids = []
-            with self.conn:
-                for r in rows:
-                    t_amt = round(float(r["amount"]), 8)
-                    t_fee = round(float(r["fee"]), 8)
-                    s_addr = r["sender"]
-                    r_addr = r["recipient"]
-                    s_bal = self.get_balance(s_addr)
-                    cost = round(t_amt + t_fee, 8)
-                    if s_bal < cost:
-                        self.conn.execute("DELETE FROM mempool WHERE tx_id = ?", (r["tx_id"],))
-                        continue
-
-                    self.conn.execute("INSERT OR REPLACE INTO balances VALUES (?, ?)", (s_addr, round(s_bal - cost, 6)))
-                    r_bal = self.get_balance(r_addr)
-                    self.conn.execute("INSERT OR REPLACE INTO balances VALUES (?, ?)", (r_addr, round(r_bal + t_amt, 6)))
-                    self.conn.execute("DELETE FROM mempool WHERE tx_id = ?", (r["tx_id"],))
-                    self.conn.execute(
-                        "INSERT OR REPLACE INTO transactions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                        (r["tx_id"], new_idx, s_addr, r_addr, t_amt, t_fee, float(r["timestamp"]), r["signature"])
-                    )
-                    tx_list.append(dict(r))
-                    committed_tx_ids.append(r["tx_id"])
-
-                if not committed_tx_ids:
-                    return
-
-                merkle = hashlib.sha256(f"block_{new_idx}_merkle:{':'.join(committed_tx_ids)}".encode()).hexdigest()
-                block_raw = f"{new_idx}:{prev_hash}:{merkle}:INSTANT_SETTLEMENT:{now:.4f}:0"
-                h1 = hashlib.sha256(block_raw.encode()).hexdigest()
-                salt = hashlib.sha256(("INSTANT_SETTLEMENT" + block_raw[:16]).encode()).hexdigest()
-                block_hash = hashlib.sha256((h1 + salt).encode()).hexdigest()
-
-                self.conn.execute(
-                    "INSERT OR REPLACE INTO blocks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (new_idx, block_hash, prev_hash, merkle, 0, 6, now, len(tx_list), "INSTANT_SETTLEMENT", json.dumps(tx_list))
-                )
 
     def get_latest_blocks(self, limit: int = 15) -> List[Dict]:
         limit = max(1, min(100, int(limit)))
