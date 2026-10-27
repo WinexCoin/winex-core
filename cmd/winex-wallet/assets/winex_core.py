@@ -244,11 +244,13 @@ class WinexBlockchain:
 
     def broadcast_to_peers(self, endpoint: str, data: dict):
         peers = self.get_peers()
-        for p in peers:
-            try:
-                requests.post(f"{p}{endpoint}", json=data, timeout=2)
-            except Exception:
-                pass
+        def _bg_broadcast():
+            for p in peers:
+                try:
+                    requests.post(f"{p}{endpoint}", json=data, timeout=1.5)
+                except Exception:
+                    pass
+        threading.Thread(target=_bg_broadcast, daemon=True).start()
 
     def get_height(self) -> int:
         cur = self.conn.cursor()
