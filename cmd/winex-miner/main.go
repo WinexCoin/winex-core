@@ -635,7 +635,7 @@ func main() {
 
 				targetHex := tmpl.Target
 				if targetHex == "" {
-					targetHex = "000000000c370000000000000000000000000000000000000000000000000000"
+					targetHex = "0000007fffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 				}
 
 				blockTimestamp := getNetworkTimestamp()
@@ -708,7 +708,7 @@ func main() {
 
 					targetHex := tmpl.Target
 					if targetHex == "" {
-						targetHex = "000000000c370000000000000000000000000000000000000000000000000000"
+						targetHex = "0000007fffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 					}
 					targetBytes := []byte(targetHex)
 

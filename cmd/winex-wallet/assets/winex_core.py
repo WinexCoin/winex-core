@@ -41,8 +41,8 @@ def get_block_reward(block_index: int) -> float:
     return round(INITIAL_BLOCK_REWARD / (2 ** era), 6)
 
 # Scarcity Dynamic Difficulty Algorithm (Bitcoin Difficulty Model)
-# Calibrated for baseline 15-minute target block time on 100 MH/s baseline (~90-95 Billion hashes)
-BASE_TARGET_INT = int("000000000c370000000000000000000000000000000000000000000000000000", 16)
+# Calibrated for baseline 60-120 seconds target block time on normal CPU/GPU compute (~16-32 Million hashes)
+BASE_TARGET_INT = int("0000007fffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)
 
 def calculate_dynamic_target(pool_remaining: float) -> Tuple[str, float]:
     pool_remaining = max(0.0, min(10_000_000.0, pool_remaining))
@@ -354,8 +354,8 @@ class WinexBlockchain:
             eda_factor = min(100.0, 1.0 + (extra_periods * 3.0))
             ratio = min(100.0, ratio * eda_factor)
 
-        # Cap minimum difficulty at 00000ffff...
-        max_target_cap = int("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)
+        # Cap minimum difficulty at 0000ffff...
+        max_target_cap = int("0000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)
         adjusted_int = min(max_target_cap, max(1, int(base_int * ratio)))
         target_hex = hex(adjusted_int)[2:].zfill(64)
         return target_hex, round(base_mult / max(0.001, ratio), 2)
@@ -634,7 +634,7 @@ class WinexBlockchain:
                 return
             new_idx = last["block_index"] + 1
             prev_hash = last["hash"]
-            miner = "WNX371611DC09BC873764B3A1EB66D447AB"
+            miner = GENESIS_VAULT_ADDR
             now = time.time()
 
             tx_list = []
@@ -670,10 +670,10 @@ class WinexBlockchain:
                     "tx_id": hashlib.sha256(f"COINBASE_{miner}_{new_idx}_{now}".encode()).hexdigest(),
                     "sender": "COINBASE",
                     "recipient": miner,
-                    "amount": 40.0,
+                    "amount": 0.0,
                     "fee": 0.0,
                     "timestamp": now,
-                    "signature": "MINER_PROOF_OF_WORK"
+                    "signature": "SYSTEM_NETWORK_SETTLEMENT"
                 }
                 committed_all = [coinbase_tx] + tx_list
 
@@ -703,12 +703,6 @@ class WinexBlockchain:
                     (coinbase_tx["tx_id"], new_idx, coinbase_tx["sender"], coinbase_tx["recipient"],
                      coinbase_tx["amount"], coinbase_tx["fee"], coinbase_tx["timestamp"], coinbase_tx["signature"])
                 )
-
-                reward = min(get_block_reward(new_idx), pool_remaining)
-                miner_bal = self.get_balance(miner)
-                self.conn.execute("INSERT OR REPLACE INTO balances VALUES (?, ?)", (miner, round(miner_bal + reward, 6)))
-                new_pool = round(max(0.0, pool_remaining - reward), 6)
-                self.conn.execute("UPDATE meta SET value = ? WHERE key = 'mining_pool'", (str(new_pool),))
 
         # Broadcast newly confirmed block to all peers
         try:

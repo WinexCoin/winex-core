@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-var defaultTargetHex = "000000000c370000000000000000000000000000000000000000000000000000"
+var defaultTargetHex = "0000007fffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 
 // SafeHTTPClient creates an HTTP client with private IP SSRF prevention and redirects disabled
 func SafeHTTPClient(timeout time.Duration) *http.Client {
