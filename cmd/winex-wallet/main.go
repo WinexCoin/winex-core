@@ -138,7 +138,42 @@ var (
 	minerState MiningState
 	stopMiner  chan struct{}
 	csrfToken  string
+
+	walletTxMu      sync.Mutex
+	walletTxHistory []WalletTxRecord
 )
+
+type WalletTxRecord struct {
+	TxID      string  `json:"tx_id"`
+	Sender    string  `json:"sender"`
+	Recipient string  `json:"recipient"`
+	Amount    float64 `json:"amount"`
+	Fee       float64 `json:"fee"`
+	Timestamp float64 `json:"timestamp"`
+	Type      string  `json:"type"`
+}
+
+func loadWalletTxHistory() {
+	p := filepath.Join(getWalletDir(), "tx_history.json")
+	b, err := os.ReadFile(p)
+	if err == nil {
+		walletTxMu.Lock()
+		_ = json.Unmarshal(b, &walletTxHistory)
+		walletTxMu.Unlock()
+	}
+}
+
+func recordWalletTx(tx WalletTxRecord) {
+	walletTxMu.Lock()
+	defer walletTxMu.Unlock()
+	walletTxHistory = append([]WalletTxRecord{tx}, walletTxHistory...)
+	if len(walletTxHistory) > 200 {
+		walletTxHistory = walletTxHistory[:200]
+	}
+	p := filepath.Join(getWalletDir(), "tx_history.json")
+	b, _ := json.MarshalIndent(walletTxHistory, "", "  ")
+	_ = os.WriteFile(p, b, 0600)
+}
 
 func initCSRFToken() {
 	b := make([]byte, 32)
@@ -903,6 +938,7 @@ func validateCSRF(r *http.Request) bool {
 func main() {
 	enableMemoryProtection()
 	initCSRFToken()
+	loadWalletTxHistory()
 	purgeLegacyVaults()
 
 	// Ensure background WINEX_Node is running on 127.0.0.1:8081 to support the network
@@ -1302,19 +1338,49 @@ func main() {
 
 	
 	mux.HandleFunc("/api/blocks", func(w http.ResponseWriter, r *http.Request) {
-		client := &http.Client{Timeout: 3 * time.Second}
-		endpoints := []string{"http://127.0.0.1:8081/api/blocks?limit=30", defaultRemoteNode + "/api/blocks?limit=30"}
+		client := &http.Client{Timeout: 4 * time.Second}
+		endpoints := []string{"http://127.0.0.1:8081/api/blocks?limit=50", defaultRemoteNode + "/api/blocks?limit=50"}
 		for _, ep := range endpoints {
-			resp, err := client.Get(ep)
+			req, err := http.NewRequest("GET", ep, nil)
+			if err != nil {
+				continue
+			}
+			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) WINEX/2.6.0")
+			resp, err := client.Do(req)
 			if err == nil && resp.StatusCode == 200 {
-				defer resp.Body.Close()
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = io.Copy(w, resp.Body)
-				return
+				body, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				var testBlks []interface{}
+				if json.Unmarshal(body, &testBlks) == nil && len(testBlks) > 1 {
+					w.Header().Set("Content-Type", "application/json")
+					w.Write(body)
+					return
+				}
 			}
 		}
+
+		// Fallback: direct remote fetch if local node had no blocks
+		req, _ := http.NewRequest("GET", defaultRemoteNode+"/api/blocks?limit=50", nil)
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) WINEX/2.6.0")
+		if resp, err := client.Do(req); err == nil && resp.StatusCode == 200 {
+			defer resp.Body.Close()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.Copy(w, resp.Body)
+			return
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte("[]"))
+	})
+
+	mux.HandleFunc("/api/wallet/history", func(w http.ResponseWriter, r *http.Request) {
+		walletTxMu.Lock()
+		historyCopy := make([]WalletTxRecord, len(walletTxHistory))
+		copy(historyCopy, walletTxHistory)
+		walletTxMu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(historyCopy)
 	})
 
 	mux.HandleFunc("/api/transactions", func(w http.ResponseWriter, r *http.Request) {
@@ -1479,6 +1545,28 @@ func main() {
 		}
 
 		if successResp != nil {
+			var respData map[string]interface{}
+			var txID string
+			if json.Unmarshal(successResp, &respData) == nil {
+				if tid, ok := respData["tx_id"].(string); ok && tid != "" {
+					txID = tid
+				}
+			}
+			if txID == "" {
+				h := sha256.Sum256([]byte(fmt.Sprintf("%s:%s:%f:%f", senderAddr, req.Recipient, req.Amount, ts)))
+				txID = hex.EncodeToString(h[:])
+			}
+
+			recordWalletTx(WalletTxRecord{
+				TxID:      txID,
+				Sender:    senderAddr,
+				Recipient: req.Recipient,
+				Amount:    req.Amount,
+				Fee:       0.0,
+				Timestamp: ts,
+				Type:      "transfer",
+			})
+
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(successStatus)
 			w.Write(successResp)
@@ -2343,17 +2431,24 @@ const htmlUI = `<!DOCTYPE html>
 
   <!-- 1. History Pane -->
   <div id="pane-history" class="tab-pane active">
-    <div class="history-toolbar">
-      <input type="text" id="filterInput" class="filter-input" placeholder="Filter ledger by block height, hash, or address..." oninput="filterHistoryTable()">
+    <div class="history-toolbar" style="display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:12px;">
+      <div style="display:flex; gap:8px; align-items:center; flex:1;">
+        <input type="text" id="filterInput" class="filter-input" placeholder="Filter ledger by block, address, txid, or type..." oninput="filterHistoryTable()" style="flex:1;">
+        <div style="display:flex; gap:4px; background:var(--bg-elevated); padding:2px; border-radius:4px; border:1px solid var(--border-hairline);">
+          <button id="filterBtnAll" class="btn-pri" style="padding:4px 10px; font-size:11px; background:var(--bg-surface); border:1px solid var(--border-strong); color:var(--text-main);" onclick="setHistoryFilter('all')">All</button>
+          <button id="filterBtnTransfers" class="btn-pri" style="padding:4px 10px; font-size:11px; background:transparent; border:none; color:var(--text-muted);" onclick="setHistoryFilter('transfers')">Transfers</button>
+          <button id="filterBtnBlocks" class="btn-pri" style="padding:4px 10px; font-size:11px; background:transparent; border:none; color:var(--text-muted);" onclick="setHistoryFilter('blocks')">Mined Blocks</button>
+        </div>
+      </div>
       <button class="btn-sync" onclick="refreshDashboard()">Sync Ledger</button>
     </div>
     <div class="grid-wrap">
       <table class="ledger-table">
         <thead>
           <tr>
-            <th style="width:70px;">State</th>
-            <th>Block / Digest Reference</th>
-            <th style="width:140px; text-align:right;">Subsidy / Value</th>
+            <th style="width:110px;">Type / State</th>
+            <th>Transaction / Ledger Reference</th>
+            <th style="width:150px; text-align:right;">Amount / Value</th>
             <th style="width:160px; text-align:right;">Timestamp</th>
           </tr>
         </thead>
@@ -2366,16 +2461,28 @@ const htmlUI = `<!DOCTYPE html>
 
   <!-- 2. Send Pane -->
   <div id="pane-send" class="tab-pane">
-    <div class="pane-content" style="max-width:560px;">
+    <div class="pane-content" style="max-width:580px;">
       <h1 class="pane-h1">Send WINEX (WNX)</h1>
-      <div class="pane-sub">0.0000 WNX ZERO PROTOCOL NETWORK FEE</div>
+      <div class="pane-sub">0.0000 WNX ZERO PROTOCOL NETWORK FEE • INSTANT FINALITY</div>
       <div class="form-group" style="margin-bottom:14px;">
         <label class="form-label">From Account (Source):</label>
-        <select id="sendSourceAccount" class="form-input" style="width:100%; height:36px;" onchange="updateSendAccountBal()"></select>
+        <select id="sendSourceAccount" class="form-input" style="width:100%; height:36px;" onchange="onSourceAccountChanged()"></select>
       </div>
       <div class="form-group" style="margin-bottom:14px;">
-        <label class="form-label">Recipient Address (WNX...):</label>
-        <input type="text" id="inpRecipient" class="form-input" placeholder="WNX...">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+          <label class="form-label" style="margin-bottom:0;">Recipient Address (Pay to):</label>
+          <span style="font-size:11.5px; color:var(--accent-cyan); font-weight:500;">Transfer between my accounts:</span>
+        </div>
+        <div style="display:flex; gap:8px; margin-bottom:6px;">
+          <select id="sendDestAccount" class="form-input" style="flex:1; height:34px; font-size:12px; font-family:'JetBrains Mono', monospace;" onchange="onSelectDestAccount(this.value)">
+            <option value="">-- Choose My Account (Internal Transfer) --</option>
+          </select>
+          <button type="button" class="btn-pri" style="background:#1e2536; border:1px solid var(--border-strong); color:var(--text-secondary); padding:0 12px; font-size:12px;" onclick="pasteToRecipient()">Paste</button>
+        </div>
+        <input type="text" id="inpRecipient" class="form-input" placeholder="WNX... (35-character destination address)" oninput="onRecipientInput()">
+        <div id="destAccountBadge" style="display:none; margin-top:5px; font-size:12px; color:var(--accent-green); background:rgba(34,197,94,0.1); padding:4px 10px; border-radius:4px; border:1px solid rgba(34,197,94,0.3);">
+          ⇄ Transferring between own accounts: <span id="destAccountName" style="font-weight:600;"></span>
+        </div>
       </div>
       <div class="form-group" style="margin-bottom:16px;">
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
@@ -2552,6 +2659,9 @@ let currentBalance = 0.0;
 let currentAddress = "";
 let isBalHidden = false;
 let allRawBlocks = [];
+let allRawTxs = [];
+let myAccountsList = [];
+let currentHistoryFilter = 'all';
 
 function toggleMenu(id, e) {
   e.stopPropagation();
@@ -2633,76 +2743,164 @@ async function refreshDashboard() {
       document.getElementById('netHeight').innerText = '#' + (dash.block_height || 0);
     }
 
+    try {
+      const resTx = await fetch('/api/wallet/history');
+      if (resTx.ok) {
+        allRawTxs = await resTx.json();
+      }
+    } catch(e) {}
+
     const resBlocks = await fetch('/api/blocks');
     if (resBlocks.ok) {
       allRawBlocks = await resBlocks.json();
-      renderHistoryTable(allRawBlocks);
     }
+    renderHistoryTable();
   } catch(e) {
     console.error("Dashboard refresh err:", e);
   }
 }
 
-function renderHistoryTable(blocks) {
+function setHistoryFilter(f) {
+  currentHistoryFilter = f;
+  ['All', 'Transfers', 'Blocks'].forEach(n => {
+    const btn = document.getElementById('filterBtn' + n);
+    if (btn) {
+      if (n.toLowerCase() === f || (f === 'all' && n === 'All')) {
+        btn.style.background = 'var(--bg-surface)';
+        btn.style.border = '1px solid var(--border-strong)';
+        btn.style.color = 'var(--text-main)';
+      } else {
+        btn.style.background = 'transparent';
+        btn.style.border = 'none';
+        btn.style.color = 'var(--text-muted)';
+      }
+    }
+  });
+  renderHistoryTable();
+}
+
+function renderHistoryTable() {
   const body = document.getElementById('historyBody');
-  if (!blocks || !Array.isArray(blocks) || blocks.length === 0) {
-    body.innerHTML = '<tr><td colspan="4" style="text-align:center; padding:32px; color:var(--text-muted);">No blocks recorded in ledger.</td></tr>';
+  if (!body) return;
+
+  const q = (document.getElementById('filterInput') ? document.getElementById('filterInput').value.trim().toLowerCase() : '');
+  const filter = currentHistoryFilter;
+
+  let combined = [];
+
+  // 1. Process Wallet Transactions
+  if (filter === 'all' || filter === 'transfers') {
+    (allRawTxs || []).forEach(tx => {
+      const isSrcMine = (myAccountsList || []).some(a => a.address && a.address.toLowerCase() === (tx.sender || '').toLowerCase());
+      const isDstMine = (myAccountsList || []).some(a => a.address && a.address.toLowerCase() === (tx.recipient || '').toLowerCase());
+
+      let typeStr = 'Transfer';
+      let stateHtml = '<span style="color:var(--accent-cyan); font-weight:600;">⇄ Transfer</span>';
+      let valueHtml = '<span style="color:var(--accent-cyan); font-weight:bold;">' + Number(tx.amount || 0).toFixed(4) + ' WNX</span>';
+
+      if (isSrcMine && isDstMine) {
+        stateHtml = '<span style="color:var(--accent-cyan); font-weight:600;">⇄ Self Transfer</span>';
+      } else if (isSrcMine) {
+        typeStr = 'Sent';
+        stateHtml = '<span style="color:#f59e0b; font-weight:600;">↑ Sent</span>';
+        valueHtml = '<span style="color:#f59e0b; font-weight:bold;">-' + Number(tx.amount || 0).toFixed(4) + ' WNX</span>';
+      } else if (isDstMine) {
+        typeStr = 'Received';
+        stateHtml = '<span style="color:var(--accent-green); font-weight:600;">↓ Received</span>';
+        valueHtml = '<span style="color:var(--accent-green); font-weight:bold;">+' + Number(tx.amount || 0).toFixed(4) + ' WNX</span>';
+      }
+
+      let timeStr = '-';
+      if (tx.timestamp) {
+        const dt = new Date(tx.timestamp * 1000);
+        timeStr = dt.toISOString().replace('T', ' ').substring(0, 19);
+      }
+
+      const txid = tx.tx_id || '';
+      const shortTxid = txid.length > 16 ? (txid.substring(0, 10) + '...' + txid.substring(txid.length - 6)) : txid;
+
+      combined.push({
+        kind: 'tx',
+        typeStr: typeStr,
+        timestamp: Number(tx.timestamp) || 0,
+        stateHtml: stateHtml,
+        refHtml: '<span style="font-family:\'JetBrains Mono\', monospace; font-size:12px; color:var(--text-main); font-weight:600;">' + shortTxid + '</span> &bull; ' +
+                 '<span style="font-size:11.5px; color:var(--text-muted);">' + (tx.sender ? tx.sender.substring(0,8)+'...' : '') + ' → ' + (tx.recipient ? tx.recipient.substring(0,8)+'...' : '') + '</span>' +
+                 '<button onclick="copyAddrText(\'' + txid + '\')" class="btn-pri" style="padding:1px 7px; font-size:10.5px; margin-left:8px; background:#1e2536; border:1px solid var(--border-strong); cursor:pointer;">Copy TXID</button>',
+        valueHtml: valueHtml,
+        timeStr: timeStr,
+        searchStr: (txid + ' ' + (tx.sender || '') + ' ' + (tx.recipient || '') + ' ' + typeStr).toLowerCase()
+      });
+    });
+  }
+
+  // 2. Process Ledger Blocks
+  if (filter === 'all' || filter === 'blocks') {
+    (allRawBlocks || []).forEach(b => {
+      const idx = b.block_index || b.index || 0;
+      if (idx === 0) return;
+      let miner = (b.miner || '').trim();
+      const isMyMiner = (myAccountsList || []).some(a => a.address && a.address.toLowerCase() === miner.toLowerCase());
+      miner = miner.replace(/[^A-Za-z0-9]/g, '');
+      const safeMiner = escapeHtml(miner);
+      let reward = Number(b.reward) || 40.0;
+
+      let timeStr = '-';
+      if (b.timestamp) {
+        const dt = new Date(b.timestamp * 1000);
+        timeStr = dt.toISOString().replace('T', ' ').substring(0, 19);
+      }
+
+      let stateHtml = isMyMiner ?
+        '<span style="color:var(--accent-green); font-weight:700;">★ Mined</span>' :
+        '<span class="cell-state" style="color:var(--text-muted);">Mined</span>';
+
+      let valHtml = isMyMiner ?
+        '<span style="color:var(--accent-green); font-weight:bold;">+' + reward.toFixed(4) + ' WNX</span>' :
+        '<span class="cell-value">+' + reward.toFixed(4) + ' WNX</span>';
+
+      combined.push({
+        kind: 'block',
+        typeStr: 'Mined',
+        timestamp: Number(b.timestamp) || 0,
+        stateHtml: stateHtml,
+        refHtml: 'Block #' + idx + ' &bull; ' +
+                 '<span onclick="copyAddrText(\'' + safeMiner + '\')" style="font-family:\'JetBrains Mono\', monospace; font-size:12px; color:' + (isMyMiner ? 'var(--accent-green)' : 'var(--accent-primary)') + '; font-weight:600; cursor:pointer;" title="Click to copy address">' + safeMiner + (isMyMiner ? ' (My Miner)' : '') + '</span>' +
+                 '<button onclick="copyAddrText(\'' + safeMiner + '\')" class="btn-pri" style="padding:1px 7px; font-size:11px; margin-left:8px; background:#1e2536; border:1px solid var(--border-strong); cursor:pointer;">Copy</button>',
+        valueHtml: valHtml,
+        timeStr: timeStr,
+        searchStr: ('block #' + idx + ' ' + safeMiner + ' ' + (b.hash || '') + ' mined').toLowerCase()
+      });
+    });
+  }
+
+  // Sort descending by timestamp
+  combined.sort((a, b) => b.timestamp - a.timestamp);
+
+  // Apply search query
+  if (q) {
+    combined = combined.filter(item => item.searchStr.includes(q));
+  }
+
+  if (combined.length === 0) {
+    body.innerHTML = '<tr><td colspan="4" style="text-align:center; padding:32px; color:var(--text-muted);">No activity recorded in ledger.</td></tr>';
     return;
   }
 
-  // Strictly sort by timestamp descending (newest on top)
-  const sortedBlocks = [...blocks].sort((a, b) => {
-    const tA = Number(a.timestamp) || 0;
-    const tB = Number(b.timestamp) || 0;
-    if (tB !== tA) return tB - tA;
-    const iA = Number(a.block_index || a.index) || 0;
-    const iB = Number(b.block_index || b.index) || 0;
-    return iB - iA;
-  });
-
   let html = '';
-  sortedBlocks.forEach(b => {
-    const idx = b.block_index || b.index || 0;
-    if (idx === 0) return; // Skip Block #0
-    let miner = (b.miner || '').trim();
-    if (!miner) miner = 'WNX8D4B5CED15F50A144899A8B3551C8CD4';
-    miner = miner.replace(/[^A-Za-z0-9]/g, '');
-    const safeMiner = escapeHtml(miner);
-    let reward = Number(b.reward) || 40.0;
-
-    let timeStr = '-';
-    if (b.timestamp) {
-      const dt = new Date(b.timestamp * 1000);
-      timeStr = dt.toISOString().replace('T', ' ').substring(0, 19);
-    }
-
+  combined.forEach(item => {
     html += '<tr>' +
-      '<td class="cell-state">Mined</td>' +
-      '<td class="cell-ref">' +
-        'Block #' + idx + ' &bull; ' +
-        '<span onclick="copyAddrText(\'' + safeMiner + '\')" style="font-family:\'JetBrains Mono\', monospace; font-size:12px; color:var(--accent-primary); font-weight:600; cursor:pointer;" title="Click to copy address">' + safeMiner + '</span>' +
-        '<button onclick="copyAddrText(\'' + safeMiner + '\')" class="btn-pri" style="padding:1px 7px; font-size:11px; margin-left:8px; background:#1e2536; border:1px solid var(--border-strong); cursor:pointer;">Copy</button>' +
-      '</td>' +
-      '<td class="cell-value">+' + reward.toFixed(4) + ' WNX</td>' +
-      '<td class="cell-time">' + timeStr + '</td>' +
+      '<td>' + item.stateHtml + '</td>' +
+      '<td class="cell-ref">' + item.refHtml + '</td>' +
+      '<td style="text-align:right; font-family:\'JetBrains Mono\', monospace;">' + item.valueHtml + '</td>' +
+      '<td class="cell-time">' + item.timeStr + '</td>' +
       '</tr>';
   });
   body.innerHTML = html;
 }
 
 function filterHistoryTable() {
-  const q = document.getElementById('filterInput').value.trim().toLowerCase();
-  if (!q) {
-    renderHistoryTable(allRawBlocks);
-    return;
-  }
-  const filtered = allRawBlocks.filter(b => {
-    const idx = (b.block_index || b.index || '').toString();
-    const miner = (b.miner || '').toLowerCase();
-    const hash = (b.hash || '').toLowerCase();
-    return idx.includes(q) || miner.includes(q) || hash.includes(q);
-  });
-  renderHistoryTable(filtered);
+  renderHistoryTable();
 }
 
 function copyCurrentAddress() {
@@ -2713,6 +2911,7 @@ function copyCurrentAddress() {
 }
 
 function populateSendAccounts(accounts, activeAddr) {
+  myAccountsList = accounts || [];
   const sel = document.getElementById('sendSourceAccount');
   if (!sel || !accounts || !Array.isArray(accounts)) return;
   const currentVal = sel.value;
@@ -2736,6 +2935,79 @@ function populateSendAccounts(accounts, activeAddr) {
     sel.appendChild(opt);
   });
   updateSendAccountBal();
+  updateDestAccountDropdown();
+}
+
+function onSourceAccountChanged() {
+  updateSendAccountBal();
+  updateDestAccountDropdown();
+}
+
+function updateDestAccountDropdown() {
+  const srcSel = document.getElementById('sendSourceAccount');
+  const dstSel = document.getElementById('sendDestAccount');
+  if (!srcSel || !dstSel || !myAccountsList) return;
+
+  const currentSrc = srcSel.value;
+  const currentDst = dstSel.value;
+  dstSel.innerHTML = '<option value="">-- Choose My Account (Internal Transfer) --</option>';
+
+  myAccountsList.forEach(acc => {
+    if (acc.address === currentSrc) return;
+    const opt = document.createElement('option');
+    opt.value = acc.address;
+    opt.dataset.label = acc.label || ('Account #' + acc.index);
+    const shortAddr = acc.address.length > 16 ? (acc.address.substring(0, 8) + '...' + acc.address.substring(acc.address.length - 6)) : acc.address;
+    opt.innerText = '#' + acc.index + ' ' + (acc.label || ('Account #' + acc.index)) + ' [' + shortAddr + '] (' + Number(acc.balance || 0).toFixed(4) + ' WNX)';
+    if (currentDst && acc.address === currentDst) opt.selected = true;
+    dstSel.appendChild(opt);
+  });
+}
+
+function onSelectDestAccount(val) {
+  const inp = document.getElementById('inpRecipient');
+  const badge = document.getElementById('destAccountBadge');
+  const nameSpan = document.getElementById('destAccountName');
+  const dstSel = document.getElementById('sendDestAccount');
+
+  if (val) {
+    inp.value = val;
+    const opt = dstSel.options[dstSel.selectedIndex];
+    if (nameSpan && opt) nameSpan.innerText = opt.dataset.label || 'My Account';
+    if (badge) badge.style.display = 'block';
+  } else {
+    if (badge) badge.style.display = 'none';
+  }
+}
+
+function onRecipientInput() {
+  const inp = document.getElementById('inpRecipient');
+  const dstSel = document.getElementById('sendDestAccount');
+  const badge = document.getElementById('destAccountBadge');
+  const nameSpan = document.getElementById('destAccountName');
+
+  const val = inp.value.trim();
+  const matched = (myAccountsList || []).find(a => a.address && a.address.toLowerCase() === val.toLowerCase());
+  if (matched) {
+    if (dstSel) dstSel.value = matched.address;
+    if (nameSpan) nameSpan.innerText = matched.label || ('Account #' + matched.index);
+    if (badge) badge.style.display = 'block';
+  } else {
+    if (dstSel) dstSel.value = "";
+    if (badge) badge.style.display = 'none';
+  }
+}
+
+async function pasteToRecipient() {
+  try {
+    const text = await navigator.clipboard.readText();
+    if (text) {
+      document.getElementById('inpRecipient').value = text.trim();
+      onRecipientInput();
+    }
+  } catch(e) {
+    alert("Clipboard paste error: " + e.message);
+  }
 }
 
 function updateSendAccountBal() {
@@ -2814,6 +3086,8 @@ async function doSendTransaction() {
       out.innerText = "Transaction Broadcast Confirmed (0.0000 WNX Fee) • TXID: " + (d.tx_id || 'Accepted');
       out.style.color = "var(--accent-green)";
       document.getElementById('inpRecipient').value = '';
+      if (document.getElementById('sendDestAccount')) document.getElementById('sendDestAccount').value = '';
+      if (document.getElementById('destAccountBadge')) document.getElementById('destAccountBadge').style.display = 'none';
       refreshDashboard();
     } else {
       const errMsg = d.detail || d.message || d.error || JSON.stringify(d);

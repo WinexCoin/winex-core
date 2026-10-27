@@ -32,7 +32,19 @@ func Run(host string, port int) {
 	StartLANAutoDiscovery(engine, port)
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = consensus.WriteJSON(w, engine.GetStatus(), 200)
+	})
+	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = consensus.WriteJSON(w, engine.GetStatus(), 200)
+	})
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = consensus.WriteJSON(w, engine.GetStatus(), 200)
+	})
+	mux.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = consensus.WriteJSON(w, engine.GetStatus(), 200)
 	})
