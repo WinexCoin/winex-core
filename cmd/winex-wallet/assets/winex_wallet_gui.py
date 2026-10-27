@@ -131,6 +131,35 @@ def save_wallet_file_atomic(file_path: str, enc_data: dict):
                 pass
         raise e
 
+def record_local_transaction(tx_record: dict):
+    """Persist sent/received transaction record to local secure ledger ~/.winex/wallet_history.json"""
+    try:
+        os.makedirs(WALLET_DIR, mode=0o700, exist_ok=True)
+        tx_hist_path = os.path.join(WALLET_DIR, "wallet_history.json")
+        history = []
+        if os.path.exists(tx_hist_path):
+            try:
+                with open(tx_hist_path, "r", encoding="utf-8") as f:
+                    history = json.load(f)
+            except Exception:
+                history = []
+        if not isinstance(history, list):
+            history = []
+        tx_h = tx_record.get("tx_hash")
+        if tx_h and any(x.get("tx_hash") == tx_h for x in history):
+            return
+        history.insert(0, tx_record)
+        if len(history) > 500:
+            history = history[:500]
+        tmp_path = os.path.join(WALLET_DIR, f".tx_tmp_{os.getpid()}_{secrets.token_hex(4)}.json")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, tx_hist_path)
+    except Exception:
+        pass
+
 def encrypt_wallet_data(data_dict: dict, password: str) -> dict:
     """Institutional AES-256-GCM Keystore with Scrypt Memory-Hard KDF (RFC 7914)"""
     salt = os.urandom(16)
@@ -1430,22 +1459,28 @@ class NetworkPollerWorker(QThread):
             result["balance"] = balances_map.get(self.address, sum(balances_map.values()))
 
         # 2. Poll Status (/api/state or /api/status)
+        best_status = None
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) WINEX/2.6.0"}
         for node in self.candidate_nodes:
             if not self._running:
                 return
-            try:
-                url = f"{node.rstrip('/')}/api/state"
-                r = requests.get(url, timeout=2.0)
-                if r.status_code == 200:
-                    result["status"] = r.json()
-                    break
-                url2 = f"{node.rstrip('/')}/api/status"
-                r2 = requests.get(url2, timeout=2.0)
-                if r2.status_code == 200:
-                    result["status"] = r2.json()
-                    break
-            except Exception:
-                pass
+            for ep in ["/api/state", "/api/status", "/stats"]:
+                try:
+                    url = f"{node.rstrip('/')}{ep}"
+                    r = requests.get(url, headers=headers, timeout=2.5)
+                    if r.status_code == 200:
+                        st = r.json()
+                        h = int(st.get("block_height", st.get("height", 0)) or 0)
+                        if best_status is None or h > int(best_status.get("block_height", best_status.get("height", 0)) or 0):
+                            best_status = st
+                        if h > 1:
+                            break
+                except Exception:
+                    pass
+            if best_status and int(best_status.get("block_height", best_status.get("height", 0)) or 0) > 1:
+                break
+        if best_status:
+            result["status"] = best_status
 
         # 3. Poll Peers
         for node in self.candidate_nodes:
@@ -1453,7 +1488,7 @@ class NetworkPollerWorker(QThread):
                 return
             try:
                 url = f"{node.rstrip('/')}/api/p2p/peers"
-                r = requests.get(url, timeout=2.0)
+                r = requests.get(url, headers=headers, timeout=2.0)
                 if r.status_code == 200:
                     result["peers"] = r.json().get("peers", [])
                     break
@@ -1461,23 +1496,53 @@ class NetworkPollerWorker(QThread):
                 pass
 
         # 4. Poll Recent Blocks & Transactions
+        found_blocks = []
         for node in self.candidate_nodes:
             if not self._running:
                 return
+            for ep in ["/api/blocks?limit=50", "/api/chain?limit=50"]:
+                try:
+                    url = f"{node.rstrip('/')}{ep}"
+                    r = requests.get(url, headers=headers, timeout=2.5)
+                    if r.status_code == 200:
+                        data = r.json()
+                        blks = data.get("blocks", data) if isinstance(data, dict) else data
+                        if isinstance(blks, list):
+                            non_zero = [b for b in blks if isinstance(b, dict) and b.get("block_index", b.get("index", 0)) > 0]
+                            if len(non_zero) > len([b for b in found_blocks if isinstance(b, dict) and b.get("block_index", b.get("index", 0)) > 0]):
+                                found_blocks = blks
+                            if len(non_zero) > 0:
+                                break
+                except Exception:
+                    pass
+            if any(isinstance(b, dict) and b.get("block_index", b.get("index", 0)) > 0 for b in found_blocks):
+                break
+        if found_blocks:
+            result["blocks"] = found_blocks
+
+        # 4b. Poll Local Transaction History (~/.winex/wallet_history.json & /api/wallet/history)
+        local_txs = []
+        tx_hist_path = os.path.join(WALLET_DIR, "wallet_history.json")
+        if os.path.exists(tx_hist_path):
             try:
-                url = f"{node.rstrip('/')}/api/chain?limit=15"
-                r = requests.get(url, timeout=2.0)
-                if r.status_code == 200:
-                    data = r.json()
-                    result["blocks"] = data.get("blocks", data) if isinstance(data, dict) else data
-                    break
-                url2 = f"{node.rstrip('/')}/api/blocks?limit=15"
-                r2 = requests.get(url2, timeout=2.0)
-                if r2.status_code == 200:
-                    result["blocks"] = r2.json()
-                    break
+                with open(tx_hist_path, "r", encoding="utf-8") as f:
+                    local_txs = json.load(f)
             except Exception:
-                pass
+                local_txs = []
+        if not isinstance(local_txs, list):
+            local_txs = []
+        try:
+            r_tx = requests.get("http://127.0.0.1:8081/api/wallet/history", timeout=1.0)
+            if r_tx.status_code == 200:
+                node_txs = r_tx.json().get("history", [])
+                existing_hashes = {tx.get("tx_hash") for tx in local_txs if tx.get("tx_hash")}
+                for ntx in node_txs:
+                    if ntx.get("tx_hash") and ntx.get("tx_hash") not in existing_hashes:
+                        local_txs.append(ntx)
+        except Exception:
+            pass
+        if local_txs:
+            result["transactions"] = local_txs
 
         # 5. Local Sovereign Core Fallback (100% Autonomous if remote web/VDS is offline)
         if "balance" not in result or "status" not in result:
@@ -1947,36 +2012,41 @@ class WinexWalletApp(QMainWindow):
         grid.addWidget(lbl_from, 0, 0)
         grid.addWidget(self.send_from_combo, 0, 1, 1, 3)
 
-        # Row 1: Pay To
+        # Row 1: Quick Transfer Between My Accounts
+        lbl_internal = QLabel("To My Account")
+        lbl_internal.setStyleSheet("color: #8e8e96; font-weight: 600;")
+        self.send_acc_dest_combo = QComboBox()
+        self.send_acc_dest_combo.setFont(QFont("JetBrains Mono", 10.5))
+        self.send_acc_dest_combo.setToolTip("Quick transfer to one of your own HD accounts")
+        self.send_acc_dest_combo.currentIndexChanged.connect(self.on_send_acc_dest_selected)
+        grid.addWidget(lbl_internal, 1, 0)
+        grid.addWidget(self.send_acc_dest_combo, 1, 1, 1, 3)
+
+        # Row 2: Pay To (External or manual destination)
         lbl_payto = QLabel("Pay to")
         lbl_payto.setStyleSheet("color: #8e8e96; font-weight: 600;")
         self.send_recip_inp = QLineEdit()
         self.send_recip_inp.setFont(QFont("JetBrains Mono", 11))
-        self.send_recip_inp.setPlaceholderText("WNX... (35-character destination address)")
+        self.send_recip_inp.setPlaceholderText("WNX... (or select destination account above)")
         self.send_recip_inp.textChanged.connect(self.on_recipient_text_changed)
 
         btn_paste = QPushButton("Paste")
         btn_paste.setProperty("class", "btn-secondary")
         btn_paste.clicked.connect(lambda: self.send_recip_inp.setText(QApplication.clipboard().text().strip()))
 
-        self.send_acc_dest_combo = QComboBox()
-        self.send_acc_dest_combo.setFont(QFont("JetBrains Mono", 10))
-        self.send_acc_dest_combo.currentIndexChanged.connect(self.on_send_acc_dest_selected)
+        grid.addWidget(lbl_payto, 2, 0)
+        grid.addWidget(self.send_recip_inp, 2, 1, 1, 2)
+        grid.addWidget(btn_paste, 2, 3)
 
-        grid.addWidget(lbl_payto, 1, 0)
-        grid.addWidget(self.send_recip_inp, 1, 1)
-        grid.addWidget(btn_paste, 1, 2)
-        grid.addWidget(self.send_acc_dest_combo, 1, 3)
-
-        # Row 2: Description
+        # Row 3: Description
         lbl_desc = QLabel("Description")
         lbl_desc.setStyleSheet("color: #8e8e96; font-weight: 600;")
         self.send_desc_inp = QLineEdit()
         self.send_desc_inp.setPlaceholderText("Local ledger memo (not broadcast on-chain)")
-        grid.addWidget(lbl_desc, 2, 0)
-        grid.addWidget(self.send_desc_inp, 2, 1, 1, 3)
+        grid.addWidget(lbl_desc, 3, 0)
+        grid.addWidget(self.send_desc_inp, 3, 1, 1, 3)
 
-        # Row 3: Amount + Max + Fee
+        # Row 4: Amount + Max + Fee
         lbl_amt = QLabel("Amount")
         lbl_amt.setStyleSheet("color: #8e8e96; font-weight: 600;")
         self.send_amt_inp = QDoubleSpinBox()
@@ -1994,15 +2064,15 @@ class WinexWalletApp(QMainWindow):
         lbl_fee_info.setFont(QFont("JetBrains Mono", 10.5))
         lbl_fee_info.setStyleSheet("color: #8e8e96;")
 
-        grid.addWidget(lbl_amt, 3, 0)
-        grid.addWidget(self.send_amt_inp, 3, 1)
-        grid.addWidget(self.btn_max, 3, 2)
-        grid.addWidget(lbl_fee_info, 3, 3)
+        grid.addWidget(lbl_amt, 4, 0)
+        grid.addWidget(self.send_amt_inp, 4, 1)
+        grid.addWidget(self.btn_max, 4, 2)
+        grid.addWidget(lbl_fee_info, 4, 3)
 
-        # Row 4: Validation status
+        # Row 5: Validation status
         self.addr_val_lbl = QLabel("Enter a valid WNX destination address.")
         self.addr_val_lbl.setStyleSheet("color: #8e8e96; font-size: 11px;")
-        grid.addWidget(self.addr_val_lbl, 4, 1, 1, 3)
+        grid.addWidget(self.addr_val_lbl, 5, 1, 1, 3)
 
         l.addWidget(form_frame)
 
@@ -2057,6 +2127,10 @@ class WinexWalletApp(QMainWindow):
         addr = self.send_acc_dest_combo.currentData()
         if addr:
             self.send_recip_inp.setText(addr)
+            txt = self.send_acc_dest_combo.currentText()
+            clean_lbl = txt.split("[")[0].strip()
+            if hasattr(self, 'send_desc_inp') and not self.send_desc_inp.text():
+                self.send_desc_inp.setText(f"Internal Transfer to {clean_lbl}")
 
     def get_selected_send_account(self) -> dict:
         if not self.wallet_data:
@@ -2198,6 +2272,21 @@ class WinexWalletApp(QMainWindow):
         if hasattr(self, 'btn_send_instant'):
             self.btn_send_instant.setEnabled(True)
             self.btn_send_instant.setText("Send")
+        send_acc = self.get_selected_send_account()
+        from_addr = send_acc.get("address", self.wallet_data.get("address", "") if self.wallet_data else "")
+        memo_txt = self.send_desc_inp.text().strip() if hasattr(self, 'send_desc_inp') else ""
+        tx_rec = {
+            "tx_hash": tx_id,
+            "type": "Sent",
+            "from": from_addr,
+            "to": recip,
+            "amount": amt,
+            "fee": 0.0,
+            "memo": memo_txt,
+            "timestamp": int(time.time()),
+            "status": "Confirmed"
+        }
+        record_local_transaction(tx_rec)
         self.clear_send_form()
         self.poll_network_data()
         QMessageBox.information(
@@ -2501,12 +2590,13 @@ class WinexWalletApp(QMainWindow):
         if hasattr(self, 'send_acc_dest_combo'):
             self.send_acc_dest_combo.blockSignals(True)
             self.send_acc_dest_combo.clear()
-            self.send_acc_dest_combo.addItem("My Accounts...", "")
+            self.send_acc_dest_combo.addItem("-- Quick Transfer to My Account --", "")
             for i, acc in enumerate(accounts):
                 addr = acc.get("address", "")
                 lbl = acc.get("label", f"Account #{acc.get('index', i)}")
+                bal = float(acc.get("balance", 0.0))
                 short_a = f"{addr[:8]}...{addr[-6:]}" if len(addr) > 16 else addr
-                self.send_acc_dest_combo.addItem(f"#{acc.get('index', i)} {lbl} ({short_a})", addr)
+                self.send_acc_dest_combo.addItem(f"#{acc.get('index', i)} {lbl} [{short_a}] ({bal:,.4f} WNX)", addr)
             self.send_acc_dest_combo.blockSignals(False)
 
     def persist_wallet_accounts(self):
@@ -3196,41 +3286,106 @@ class WinexWalletApp(QMainWindow):
             self.discovered_peers = data["peers"]
 
         # 4. Update Blocks / Tx History (Informational mining & transfer ledger)
-        if "blocks" in data and hasattr(self, 'recent_table'):
-            raw_blocks = data["blocks"]
+        if hasattr(self, 'recent_table'):
+            raw_blocks = data.get("blocks", [])
+            raw_txs = data.get("transactions", [])
+            user_addrs = set(self.addresses_list if hasattr(self, 'addresses_list') else [])
+            if self.wallet_data:
+                for acc in self.wallet_data.get("accounts", []):
+                    if acc.get("address"):
+                        user_addrs.add(acc.get("address"))
+
+            entries = []
+
+            # 4a. Format local & network transactions
+            if isinstance(raw_txs, list):
+                for tx in raw_txs:
+                    if not isinstance(tx, dict):
+                        continue
+                    ts = float(tx.get("timestamp") or 0.0)
+                    tx_type = tx.get("type", "Sent")
+                    to_addr = tx.get("to", "")
+                    from_addr = tx.get("from", "")
+                    amt = float(tx.get("amount") or 0.0)
+                    memo = tx.get("memo", "")
+                    tx_hash = tx.get("tx_hash", "")
+                    short_hash = f"{tx_hash[:10]}...{tx_hash[-6:]}" if len(tx_hash) > 16 else tx_hash
+                    short_to = f"{to_addr[:10]}...{to_addr[-6:]}" if len(to_addr) > 16 else to_addr
+                    
+                    if to_addr in user_addrs and from_addr in user_addrs:
+                        state_lbl = "Self Transfer"
+                        color_hex = "#38bdf8" # Sky blue
+                        val_str = f"{amt:,.4f} WNX"
+                        desc = f"Transfer to {short_to}" + (f" ({memo})" if memo else f" [{short_hash}]")
+                    elif to_addr in user_addrs:
+                        state_lbl = "Received"
+                        color_hex = "#22c55e" # Green
+                        val_str = f"+{amt:,.4f} WNX"
+                        desc = f"Received from {from_addr[:10]}..." + (f" ({memo})" if memo else f" [{short_hash}]")
+                    else:
+                        state_lbl = "Sent"
+                        color_hex = "#f59e0b" # Amber
+                        val_str = f"-{amt:,.4f} WNX"
+                        desc = f"Payment to {short_to}" + (f" ({memo})" if memo else f" [{short_hash}]")
+
+                    entries.append({
+                        "ts": ts,
+                        "state": state_lbl,
+                        "color": color_hex,
+                        "desc": desc,
+                        "value": val_str
+                    })
+
+            # 4b. Format mined blocks
             if isinstance(raw_blocks, list):
-                # Never show Block #0 (Network Reserve) on the public History ledger
-                filtered_blocks = [
-                    b for b in raw_blocks
-                    if isinstance(b, dict) and b.get("block_index", b.get("index", 0)) != 0
-                ]
-
-                # Strictly sort by timestamp descending (newest on top)
-                def get_sort_key(b):
-                    try:
-                        ts = float(b.get("timestamp") or 0.0)
-                    except (ValueError, TypeError):
-                        ts = 0.0
-                    try:
-                        idx = int(b.get("block_index", b.get("index", 0)) or 0)
-                    except (ValueError, TypeError):
-                        idx = 0
-                    return (ts, idx)
-
-                filtered_blocks.sort(key=get_sort_key, reverse=True)
-
-                self.recent_table.setRowCount(len(filtered_blocks))
-                for i, b in enumerate(filtered_blocks):
-                    status_item = QTableWidgetItem("Mined")
-                    status_item.setForeground(QColor("#22c55e"))
-                    self.recent_table.setItem(i, 0, status_item)
+                for b in raw_blocks:
+                    if not isinstance(b, dict):
+                        continue
                     b_idx = b.get("block_index", b.get("index", 0))
-                    miner_addr = b.get("miner", "Unknown")
-                    short_miner = miner_addr[:14] + "..." if len(miner_addr) > 16 else miner_addr
-                    reward_val = b.get("reward", 40.0)
-                    self.recent_table.setItem(i, 1, QTableWidgetItem(f"Block #{b_idx} mined by {short_miner}"))
-                    self.recent_table.setItem(i, 2, QTableWidgetItem(f"+{reward_val:.4f} WNX"))
-                    ts_val = b.get("timestamp", 0)
+                    if b_idx == 0:
+                        continue
+                    ts = float(b.get("timestamp") or 0.0)
+                    miner = b.get("miner", "Unknown")
+                    reward = float(b.get("reward") or 40.0)
+                    is_mine = (miner in user_addrs)
+                    state_lbl = "Mined (You)" if is_mine else "Mined"
+                    color_hex = "#22c55e" if is_mine else "#10b981"
+                    short_miner = miner[:12] + "..." if len(miner) > 16 else miner
+                    desc = f"Block #{b_idx} mined by {short_miner}"
+                    val_str = f"+{reward:,.4f} WNX"
+                    entries.append({
+                        "ts": ts,
+                        "state": state_lbl,
+                        "color": color_hex,
+                        "desc": desc,
+                        "value": val_str
+                    })
+
+            # Sort descending by timestamp
+            entries.sort(key=lambda x: x.get("ts", 0), reverse=True)
+
+            if not entries:
+                self.recent_table.setRowCount(1)
+                sync_item = QTableWidgetItem("Syncing")
+                sync_item.setForeground(QColor("#38bdf8"))
+                self.recent_table.setItem(0, 0, sync_item)
+                self.recent_table.setItem(0, 1, QTableWidgetItem("Connecting to WINEX network nodes (winexcoin.com)..."))
+                self.recent_table.setItem(0, 2, QTableWidgetItem("-"))
+                self.recent_table.setItem(0, 3, QTableWidgetItem("Waiting for peer sync"))
+            else:
+                self.recent_table.setRowCount(len(entries))
+                for i, item in enumerate(entries):
+                    st_item = QTableWidgetItem(item["state"])
+                    st_item.setForeground(QColor(item["color"]))
+                    self.recent_table.setItem(i, 0, st_item)
+                    self.recent_table.setItem(i, 1, QTableWidgetItem(item["desc"]))
+                    v_item = QTableWidgetItem(item["value"])
+                    if item["value"].startswith("-"):
+                        v_item.setForeground(QColor("#ef4444"))
+                    elif item["value"].startswith("+"):
+                        v_item.setForeground(QColor("#22c55e"))
+                    self.recent_table.setItem(i, 2, v_item)
+                    ts_val = item.get("ts", 0)
                     ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts_val)) if ts_val else "-"
                     self.recent_table.setItem(i, 3, QTableWidgetItem(ts_str))
 
