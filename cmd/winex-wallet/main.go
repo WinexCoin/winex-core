@@ -75,7 +75,6 @@ func getConsensusNodes(preferred string) []string {
 	}
 	defaults := []string{
 		"https://winexcoin.com",
-		"http://130.61.60.162:8081",
 		"http://127.0.0.1:8081",
 	}
 	for _, d := range defaults {

@@ -139,23 +139,35 @@ class StratumClient:
         ]
         await self.send_json({"id": None, "method": "mining.notify", "params": params})
 
+    async def read_line_bounded(self) -> Optional[bytes]:
+        """Reads stream with strict real-time byte chunk limiting to prevent OOM buffer bombs."""
+        buf = bytearray()
+        while True:
+            chunk = await self.reader.read(128)
+            if not chunk:
+                return None if not buf else bytes(buf)
+            buf.extend(chunk)
+            if len(buf) > MAX_FRAME_SIZE:
+                logger.warning(f"Oversized frame from {self.client_ip} ({len(buf)} bytes > {MAX_FRAME_SIZE}). Terminating connection.")
+                return None
+            if b"\n" in chunk:
+                line, rest = buf.split(b"\n", 1)
+                return bytes(line)
+
     async def handle(self):
         global active_ip_counts, connected_miners
         try:
             while True:
-                line_task = self.reader.readline()
                 try:
-                    raw_line = await asyncio.wait_for(line_task, timeout=IDLE_TIMEOUT)
+                    raw_line = await asyncio.wait_for(self.read_line_bounded(), timeout=IDLE_TIMEOUT)
                 except asyncio.TimeoutError:
                     logger.debug(f"Client {self.client_ip} timed out (idle)")
                     break
 
-                if not raw_line:
+                if raw_line is None:
                     break
-
-                if len(raw_line) > MAX_FRAME_SIZE:
-                    logger.warning(f"Oversized frame from {self.client_ip} ({len(raw_line)} bytes). Terminating.")
-                    break
+                if not raw_line.strip():
+                    continue
 
                 now = time.time()
                 if now - self.last_msg_reset > 1.0:
@@ -205,8 +217,8 @@ class StratumClient:
             worker_id = str(params[0]) if len(params) > 0 else "unknown"
             # Extract address before dot if worker formatted as address.worker1
             raw_addr = worker_id.split(".")[0].strip()
-            # Basic validation
-            if re.match(r"^[A-Za-z0-9_-]{20,80}$", raw_addr):
+            # Strict WINEX 35-character address validation (^WNX[0-9A-F]{32}$)
+            if re.match(r"^WNX[0-9A-F]{32}$", raw_addr):
                 self.wallet_address = raw_addr
                 self.worker_name = worker_id
                 self.authorized = True
@@ -218,7 +230,7 @@ class StratumClient:
                 if current_job:
                     await self.send_notify(current_job, clean_jobs=True)
             else:
-                await self.send_json({"id": req_id, "result": False, "error": [20, "Invalid wallet address format", None]})
+                await self.send_json({"id": req_id, "result": False, "error": [20, "Invalid WINEX payout address (expected WNX + 32 uppercase hex chars)", None]})
 
         elif method == "mining.submit":
             if not self.authorized:

@@ -39,7 +39,6 @@ from PySide6.QtGui import QFont, QPixmap, QColor, QIcon, QImage, QPainter, QActi
 DEFAULT_NODE = "https://winexcoin.com"
 BOOTSTRAP_NODES = [
     "https://winexcoin.com",
-    "http://130.61.60.162:8081",
     "http://127.0.0.1:8081"
 ]
 WALLET_DIR = os.path.expanduser("~/.winex")
@@ -1271,22 +1270,77 @@ class ColdStorageDialog(QDialog):
             return
         try:
             payload = json.loads(txt)
+            if not isinstance(payload, dict):
+                raise ValueError("JSON payload must be an object")
+
+            # Validate strict fields
+            sender = str(payload.get("sender", "")).strip()
+            recip = str(payload.get("recipient", "")).strip()
+            if not validate_address_format(sender) or not validate_address_format(recip):
+                raise ValueError("Invalid WNX address format for sender or recipient")
+
+            amount_val = payload.get("amount")
+            if amount_val is None:
+                raise ValueError("Missing amount field")
+            amt = float(amount_val)
+            if amt <= 0.0 or amt > 12100000.0:
+                raise ValueError("Amount out of valid protocol bounds (0 < amount <= 12,100,000 WNX)")
+
+            fee_val = payload.get("fee", 0.0)
+            fee = float(fee_val)
+            if fee < 0.0 or fee > 1000.0:
+                raise ValueError("Fee out of valid protocol bounds")
+
+            ts = int(payload.get("timestamp", time.time()))
+            nonce = int(payload.get("nonce", 0))
+            chain_id = str(payload.get("chain_id", "WINEX-MAINNET-1")).strip()
+            if chain_id != "WINEX-MAINNET-1":
+                raise ValueError(f"Chain ID mismatch: expected WINEX-MAINNET-1, got {chain_id}")
+
             enc = load_encrypted_wallet_dict()
             dec = decrypt_wallet_data(enc, pwd)
             priv = dec["private_key"]
             pub = dec["public_key"]
-            sender = payload["sender"]
-            recip = payload["recipient"]
-            amt = float(payload["amount"])
-            ts = float(payload["timestamp"])
-            msg = f"{sender}:{recip}:{amt:.4f}:0.0000:{ts:.4f}"
-            sig = sign_transaction(priv, msg)
+
+            # Derive address to guarantee key ownership
+            derived_addr = "WNX" + hashlib.sha256(bytes.fromhex(pub)).hexdigest()[:32].upper()
+            if derived_addr != sender:
+                raise ValueError(f"Selected wallet key does not match sender address {sender} (Derived: {derived_addr})")
+
+            # Explicit human-readable confirmation prompt with exact satoshis
+            amt_sat = int(round(amt * 100000000))
+            fee_sat = int(round(fee * 100000000))
+            confirm_msg = (
+                f"Confirm Offline Transaction Signing:\n\n"
+                f"• Network Chain ID: {chain_id}\n"
+                f"• From (Sender):    {sender}\n"
+                f"• To (Recipient):   {recip}\n"
+                f"• Amount:           {amt:.8f} WNX ({amt_sat:,} Satoshis)\n"
+                f"• Fee:              {fee:.8f} WNX ({fee_sat:,} Satoshis)\n"
+                f"• Nonce:            {nonce}\n"
+                f"• Timestamp:        {ts}\n\n"
+                f"Do you authorize cryptographic signature generation?"
+            )
+            confirm_box = QMessageBox.question(
+                self, "Authorize Transaction Signature", confirm_msg,
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if confirm_box != QMessageBox.Yes:
+                QMessageBox.information(self, "Cancelled", "Transaction signing cancelled by user.")
+                return
+
+            canonical_msg = f"WINEX-TX-v1|{chain_id}|{sender}|{recip}|{amt_sat}|{fee_sat}|{nonce}|{ts}"
+            sig = sign_transaction(priv, canonical_msg)
             del priv
             del dec
             import gc
             gc.collect()
 
             signed_payload = dict(payload)
+            signed_payload["amount_sat"] = amt_sat
+            signed_payload["fee_sat"] = fee_sat
+            signed_payload["nonce"] = nonce
+            signed_payload["chain_id"] = chain_id
             signed_payload["signature"] = sig
             signed_payload["public_key"] = pub
             self.cs_signed_out.setText(json.dumps(signed_payload, indent=2))

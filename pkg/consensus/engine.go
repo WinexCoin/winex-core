@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"net"
 	"net/http"
@@ -160,27 +161,72 @@ func NewNodeEngine(dataPath string, bootstrap []string) *NodeEngine {
 	return n
 }
 
-// Load genesis or recover existing chain state
+// ReplayAndVerifyLedger verifies block continuity, PoW and recomputes balances from scratch
+func (n *NodeEngine) ReplayAndVerifyLedger(blocks []Block) (map[string]int64, int64, error) {
+	if len(blocks) == 0 {
+		return nil, 0, errors.New("empty block chain")
+	}
+	if blocks[0].Hash != GenesisHash || blocks[0].Index != 0 {
+		return nil, 0, errors.New("genesis block mismatch")
+	}
+
+	computedBalances := make(map[string]int64)
+	computedBalances[GenesisVaultAddr] = GenesisSupplySat
+	computedPool := InitialPoolSat
+
+	for i := 1; i < len(blocks); i++ {
+		prev := &blocks[i-1]
+		curr := &blocks[i]
+		if err := n.ValidateBlock(prev, curr); err != nil {
+			return nil, 0, fmt.Errorf("block #%d validation failed: %w", curr.Index, err)
+		}
+
+		reward := curr.RewardSat
+		if reward > computedPool {
+			reward = computedPool
+		}
+		computedBalances[curr.Miner] += reward
+		if computedPool >= reward {
+			computedPool -= reward
+		}
+
+		// Replay transactions in block
+		for _, tx := range curr.Txs {
+			totalCost := tx.AmountSat + tx.FeeSat
+			if computedBalances[tx.Sender] < totalCost {
+				return nil, 0, fmt.Errorf("block #%d transaction %s: insufficient balance for sender %s", curr.Index, tx.TxID, tx.Sender)
+			}
+			computedBalances[tx.Sender] -= totalCost
+			computedBalances[tx.Recipient] += tx.AmountSat
+			computedBalances[curr.Miner] += tx.FeeSat
+		}
+	}
+
+	return computedBalances, computedPool, nil
+}
+
+// Load genesis or recover existing chain state with cryptographic audit
 func (n *NodeEngine) loadOrInitGenesis() {
 	_ = os.MkdirAll(filepath.Dir(n.dataPath), 0700)
 
 	if b, err := os.ReadFile(n.dataPath); err == nil {
 		var s BlockchainState
 		if err := json.Unmarshal(b, &s); err == nil && len(s.Blocks) > 0 {
-			n.state = s
-			if n.state.BalancesSat == nil {
-				n.state.BalancesSat = make(map[string]int64)
-			}
-			if n.state.AccountNonces == nil {
-				n.state.AccountNonces = make(map[string]int64)
-			}
-			if n.state.SeenSigs == nil {
-				n.state.SeenSigs = make(map[string]int64)
-			}
-			// Verify genesis block integrity
-			if n.state.Blocks[0].Hash != GenesisHash {
-				fmt.Printf("[CRITICAL] Genesis hash mismatch in %s. Re-anchoring to canonical genesis.\n", n.dataPath)
+			// Cryptographically replay and audit the chain before trusting in-memory state
+			verifiedBalances, verifiedPool, err := n.ReplayAndVerifyLedger(s.Blocks)
+			if err != nil {
+				fmt.Printf("[SECURITY WARNING] Corrupted or manipulated chain in %s (%v). Quarantining corrupted file and resetting to canonical genesis.\n", n.dataPath, err)
+				_ = os.Rename(n.dataPath, fmt.Sprintf("%s.corrupted.%d", n.dataPath, time.Now().Unix()))
 			} else {
+				n.state = s
+				n.state.BalancesSat = verifiedBalances
+				n.state.PoolRemainingSat = verifiedPool
+				if n.state.AccountNonces == nil {
+					n.state.AccountNonces = make(map[string]int64)
+				}
+				if n.state.SeenSigs == nil {
+					n.state.SeenSigs = make(map[string]int64)
+				}
 				return
 			}
 		}
@@ -200,9 +246,12 @@ func (n *NodeEngine) loadOrInitGenesis() {
 	}
 
 	n.state.Blocks = []Block{genesis}
+	n.state.BalancesSat = make(map[string]int64)
 	n.state.BalancesSat[GenesisVaultAddr] = GenesisSupplySat
 	n.state.PoolRemainingSat = InitialPoolSat
-	n.saveToDiskAtomic()
+	n.state.AccountNonces = make(map[string]int64)
+	n.state.SeenSigs = make(map[string]int64)
+	_ = n.saveToDiskAtomic()
 }
 
 // Atomic file write using tmp + fsync + rename
@@ -434,12 +483,19 @@ func (n *NodeEngine) AddTransaction(sender, recip string, amountSat, feeSat, non
 	if sender == recip {
 		return false, "Self-transfers are prohibited"
 	}
-	if amountSat <= 0 {
-		return false, "Amount must be greater than zero Satoshis"
+	// Strict overflow and bounds checks for amount and fee
+	if amountSat <= 0 || amountSat > MaxSupplySat {
+		return false, "Invalid transfer amount: out of protocol bounds (must be > 0 and <= MaxSupply)"
 	}
-	if feeSat < 0 {
-		return false, "Fee cannot be negative"
+	if feeSat < 0 || feeSat > 1000*SatoshiPerCoin {
+		return false, "Invalid fee parameter: out of protocol bounds"
 	}
+
+	// Arithmetic overflow check on totalReqSat = amountSat + feeSat
+	if amountSat > (math.MaxInt64 - feeSat) {
+		return false, "Integer overflow detected in transfer calculation"
+	}
+	totalReqSat := amountSat + feeSat
 
 	now := time.Now().Unix()
 	if ts < now-86400 || ts > now+7200 {
@@ -481,13 +537,23 @@ func (n *NodeEngine) AddTransaction(sender, recip string, amountSat, feeSat, non
 		return false, fmt.Sprintf("Nonce too low: expected %d, got %d", expectedNonce, nonce)
 	}
 
-	totalReqSat := amountSat + feeSat
 	senderBalSat := n.GetBalanceLocked(sender)
 	if senderBalSat < totalReqSat {
 		return false, fmt.Sprintf("Insufficient balance: available %d satoshis, required %d satoshis", senderBalSat, totalReqSat)
 	}
 
-	// Deduct balance and update state
+	// Recipient balance overflow check
+	recipBalSat := n.GetBalanceLocked(recip)
+	if recipBalSat > (MaxSupplySat - amountSat) {
+		return false, "Recipient balance overflow: cannot exceed maximum supply"
+	}
+
+	// Atomic state transition with rollback if persistence fails
+	prevSenderBal := n.state.BalancesSat[sender]
+	prevRecipBal := n.state.BalancesSat[recip]
+	prevNonce := n.state.AccountNonces[sender]
+	prevSeenSig, hadSeenSig := n.state.SeenSigs[sig]
+
 	n.state.BalancesSat[sender] -= totalReqSat
 	n.state.BalancesSat[recip] += amountSat
 	if nonce >= expectedNonce {
@@ -495,7 +561,20 @@ func (n *NodeEngine) AddTransaction(sender, recip string, amountSat, feeSat, non
 	}
 	n.state.SeenSigs[sig] = now + 86400 // Store for 24h window
 	n.state.Mempool = append(n.state.Mempool, tx)
-	_ = n.saveToDiskAtomic()
+
+	if err := n.saveToDiskAtomic(); err != nil {
+		// Rollback in-memory state on persistence failure
+		n.state.BalancesSat[sender] = prevSenderBal
+		n.state.BalancesSat[recip] = prevRecipBal
+		n.state.AccountNonces[sender] = prevNonce
+		if hadSeenSig {
+			n.state.SeenSigs[sig] = prevSeenSig
+		} else {
+			delete(n.state.SeenSigs, sig)
+		}
+		n.state.Mempool = n.state.Mempool[:len(n.state.Mempool)-1]
+		return false, fmt.Sprintf("State persistence failure: %v", err)
+	}
 
 	return true, tx.TxID
 }

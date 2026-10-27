@@ -3,13 +3,16 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,8 +21,131 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
+
+func isPrivateOrMetadataIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+		return true
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		// 169.254.169.254 (Cloud metadata) and link local
+		if ip4[0] == 169 && ip4[1] == 254 {
+			return true
+		}
+		// 100.64.0.0/10 (Carrier grade NAT)
+		if ip4[0] == 100 && (ip4[1] >= 64 && ip4[1] <= 127) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsSafeMinerEndpoint validates endpoint scheme, hostname, and resolved IP
+func IsSafeMinerEndpoint(rawURL string) bool {
+	rawURL = strings.TrimSpace(rawURL)
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	// Allow loopback for local node mining
+	host := u.Hostname()
+	if host == "127.0.0.1" || host == "localhost" {
+		return u.Scheme == "http" || u.Scheme == "https"
+	}
+	// Remote nodes MUST use HTTPS
+	if u.Scheme != "https" {
+		return false
+	}
+	// Prevent local domains
+	hLower := strings.ToLower(host)
+	if strings.HasSuffix(hLower, ".local") || strings.HasSuffix(hLower, ".internal") || strings.HasSuffix(hLower, ".onion") {
+		return false
+	}
+	ip := net.ParseIP(host)
+	if ip != nil {
+		return !isPrivateOrMetadataIP(ip)
+	}
+	// Resolve DNS and check all IPs
+	ips, err := net.LookupIP(host)
+	if err != nil || len(ips) == 0 {
+		return false
+	}
+	for _, rip := range ips {
+		if isPrivateOrMetadataIP(rip) {
+			return false
+		}
+	}
+	return true
+}
+
+func newSafeMinerHTTPClient(timeout time.Duration) *http.Client {
+	dialer := &net.Dialer{
+		Timeout:   timeout,
+		KeepAlive: 30 * time.Second,
+		Control: func(network, address string, c syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				host = address
+			}
+			if host == "127.0.0.1" || host == "::1" {
+				return nil
+			}
+			ip := net.ParseIP(host)
+			if ip != nil && isPrivateOrMetadataIP(ip) {
+				return errors.New("SSRF protection: prohibited private/metadata IP")
+			}
+			return nil
+		},
+	}
+
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			if host == "127.0.0.1" || host == "localhost" {
+				return dialer.DialContext(ctx, network, net.JoinHostPort("127.0.0.1", port))
+			}
+			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+			if err != nil {
+				return nil, err
+			}
+			for _, ip := range ips {
+				if isPrivateOrMetadataIP(ip.IP) {
+					return nil, fmt.Errorf("SSRF protection: host %s resolved to prohibited IP %s", host, ip.IP.String())
+				}
+			}
+			return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+		},
+		ResponseHeaderTimeout: timeout,
+		MaxIdleConns:          50,
+		IdleConnTimeout:       60 * time.Second,
+	}
+
+	return &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return errors.New("stopped after 5 redirects")
+			}
+			// Enforce HTTPS on redirects and re-verify endpoint
+			if req.URL.Scheme != "https" && req.URL.Hostname() != "127.0.0.1" && req.URL.Hostname() != "localhost" {
+				return errors.New("HTTP redirect prohibited (must remain HTTPS)")
+			}
+			if !IsSafeMinerEndpoint(req.URL.String()) {
+				return errors.New("redirect to prohibited host/IP blocked")
+			}
+			return nil
+		},
+	}
+}
 
 type MiningTemplate struct {
 	BlockIndex  int64   `json:"block_index"`
@@ -100,10 +226,9 @@ func (mm *MeshManager) DiscoverPeers(client *http.Client) {
 					continue
 				}
 				if !strings.HasPrefix(p, "http://") && !strings.HasPrefix(p, "https://") {
-					p = "http://" + p
+					p = "https://" + p
 				}
-				u, err := url.Parse(p)
-				if err == nil && u.Host != "" && len(discovered) < 100 {
+				if IsSafeMinerEndpoint(p) && len(discovered) < 100 {
 					discovered[p] = true
 				}
 			}
@@ -408,13 +533,15 @@ func main() {
 		"https://winexcoin.com",
 	}
 	if nodeFlag != "" {
+		if !IsSafeMinerEndpoint(nodeFlag) {
+			fmt.Printf("\n \033[38;2;239;68;68m[FATAL ERROR]\033[0m Invalid or unsafe node URL: %s (Must be loopback or public HTTPS)\n", nodeFlag)
+			os.Exit(1)
+		}
 		seedNodes = append([]string{nodeFlag}, seedNodes...)
 	}
 
 	mm := NewMeshManager(seedNodes)
-	httpClient := &http.Client{
-		Timeout: 5 * time.Second,
-	}
+	httpClient := newSafeMinerHTTPClient(8 * time.Second)
 
 	var totalHashes uint64
 	var totalSolved uint64

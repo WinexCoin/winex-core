@@ -1,0 +1,1 @@
+../cmd/winex-wallet/assets/winex_core.py

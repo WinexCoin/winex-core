@@ -67,7 +67,13 @@ async def security_and_auth_gate(request: Request, call_next):
             pass
 
     if request.method == "POST":
-        client_ip = request.headers.get("cf-connecting-ip") or (request.client.host if request.client else "unknown")
+        # Only trust cf-connecting-ip if client connection originates from localhost proxy or trusted Cloudflare IP
+        raw_remote = request.client.host if request.client else "unknown"
+        if raw_remote in ("127.0.0.1", "::1", "localhost") and "cf-connecting-ip" in request.headers:
+            client_ip = request.headers.get("cf-connecting-ip").strip()
+        else:
+            client_ip = raw_remote
+
         if not check_api_rate_limit(client_ip, request.url.path, max_requests=60, window_sec=60.0):
             return Response(content="Too Many Requests", status_code=429)
 

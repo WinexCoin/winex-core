@@ -28,6 +28,7 @@ const (
 	GenesisHash       = "00003789c9e082b2310f3212f4af4aa6daded8d3e8861285ea6c74fd37cfd1a4"
 	MaxReorgDepth     = 10
 	TargetBlockTime   = 900 // 15 minutes (in seconds)
+	MaxSupplySat      = GenesisSupplySat + InitialPoolSat // 12,100,000 WNX (in satoshis)
 )
 
 var addrRegex = regexp.MustCompile(`^WNX[0-9A-F]{32}$`)

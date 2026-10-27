@@ -38,14 +38,15 @@ func writeJSON(w http.ResponseWriter, data interface{}, code int) {
 }
 
 func main() {
-	ensureInteractiveTerminal()
-
 	var port = flag.Int("port", 8081, "Node HTTP listen port")
 	var host = flag.String("host", "127.0.0.1", "Node listen address (use 0.0.0.0 for public relay)")
-	var daemon = flag.Bool("daemon", false, "Run as headless background P2P daemon")
+	var daemon = flag.Bool("daemon", false, "Run as headless background P2P daemon (suppresses interactive terminal clear)")
 	var bootstrap = flag.String("bootstrap", "https://winexcoin.com", "Comma-separated HTTPS bootstrap seeds")
 	flag.Parse()
-	_ = daemon
+
+	if !*daemon {
+		ensureInteractiveTerminal()
+	}
 
 	var seeds []string
 	for _, s := range strings.Split(*bootstrap, ",") {
