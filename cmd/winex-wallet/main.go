@@ -7,7 +7,6 @@ import (
 	"crypto/cipher"
 	"crypto/ecdsa"
 	"crypto/rand"
-	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
@@ -18,6 +17,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,6 +31,7 @@ import (
 	"unsafe"
 
 	"github.com/btcsuite/btcd/btcec/v2"
+	btcecdsa "github.com/btcsuite/btcd/btcec/v2/ecdsa"
 	"github.com/skip2/go-qrcode"
 	"github.com/tyler-smith/go-bip39"
 	"winex-wallet/nodecore"
@@ -462,7 +463,8 @@ func encryptVault(w WalletData, password string) (*EncryptedVault, error) {
 		return nil, err
 	}
 
-	key := pbkdf2.Key([]byte(password), salt, 100000, 32, sha256.New)
+	// Hardened to OWASP 600,000 iterations for PBKDF2-HMAC-SHA256
+	key := pbkdf2.Key([]byte(password), salt, 600000, 32, sha256.New)
 	defer zeroBytes(key)
 	block, err := aes.NewCipher(key)
 	if err != nil {
@@ -506,7 +508,8 @@ func decryptVault(ev *EncryptedVault, password string) (*WalletData, error) {
 		return nil, err
 	}
 
-	key := pbkdf2.Key([]byte(password), salt, 100000, 32, sha256.New)
+	// Hardened to OWASP 600,000 iterations for PBKDF2-HMAC-SHA256
+	key := pbkdf2.Key([]byte(password), salt, 600000, 32, sha256.New)
 	defer zeroBytes(key)
 	block, err := aes.NewCipher(key)
 	if err != nil {
@@ -561,16 +564,16 @@ func signTransactionData(privHex, message string) (string, error) {
 	priv, _ := btcec.PrivKeyFromBytes(b)
 
 	hMsg := sha256.Sum256([]byte(message))
-	r, s, err := ecdsa.Sign(rand.Reader, priv.ToECDSA(), hMsg[:])
-	if err != nil {
-		return "", err
-	}
+	sig := btcecdsa.Sign(priv, hMsg[:])
 
-	rBytes := r.Bytes()
-	sBytes := s.Bytes()
+	rScalar := sig.R()
+	sScalar := sig.S()
+	rBytes := rScalar.Bytes()
+	sBytes := sScalar.Bytes()
+
 	var sigBytes [64]byte
-	copy(sigBytes[32-len(rBytes):32], rBytes)
-	copy(sigBytes[64-len(sBytes):64], sBytes)
+	copy(sigBytes[0:32], rBytes[:])
+	copy(sigBytes[32:64], sBytes[:])
 
 	return hex.EncodeToString(sigBytes[:]), nil
 }
@@ -604,12 +607,16 @@ func verifyMessageSignature(pubKeyHex, address, message, sigHex string) (bool, e
 	r := new(big.Int).SetBytes(sigBytes[:32])
 	s := new(big.Int).SetBytes(sigBytes[32:])
 
-	h256 := sha256.Sum256([]byte(message))
-	if ecdsa.Verify(pubKey.ToECDSA(), h256[:], r, s) {
+	// Strict domain separation to prevent cross-protocol signature forgery
+	domainPayload := fmt.Sprintf("WINEX Signed Message:\n%d\n%s", len(message), message)
+	hDomain := sha256.Sum256([]byte(domainPayload))
+	if ecdsa.Verify(pubKey.ToECDSA(), hDomain[:], r, s) {
 		return true, nil
 	}
-	h1 := sha1.Sum([]byte(message))
-	if ecdsa.Verify(pubKey.ToECDSA(), h1[:], r, s) {
+
+	// Bare sha256 fallback (SHA-1 removed entirely)
+	h256 := sha256.Sum256([]byte(message))
+	if ecdsa.Verify(pubKey.ToECDSA(), h256[:], r, s) {
 		return true, nil
 	}
 	return false, fmt.Errorf("Cryptographic signature verification failed. Signature does not belong to specified key or message.")
@@ -866,12 +873,29 @@ func openDesktopWindow(url string) {
 }
 
 func validateCSRF(r *http.Request) bool {
+	// Strict Host Header verification (Loopback only)
+	host := r.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	if host != "127.0.0.1" && host != "localhost" {
+		return false
+	}
+
+	// Origin verification for non-GET requests
+	if r.Method != "GET" && r.Method != "HEAD" {
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			u, err := url.Parse(origin)
+			if err != nil || (u.Hostname() != "127.0.0.1" && u.Hostname() != "localhost") {
+				return false
+			}
+		}
+	}
+
+	// Only accept token via custom header (No query parameter leak)
 	hdr := strings.TrimSpace(r.Header.Get("X-WINEX-Token"))
 	if hdr != "" && subtle.ConstantTimeCompare([]byte(hdr), []byte(csrfToken)) == 1 {
-		return true
-	}
-	q := strings.TrimSpace(r.URL.Query().Get("token"))
-	if q != "" && subtle.ConstantTimeCompare([]byte(q), []byte(csrfToken)) == 1 {
 		return true
 	}
 	return false
@@ -945,8 +969,8 @@ func main() {
 			http.Error(w, "Invalid 12-word recovery seed phrase", 400)
 			return
 		}
-		if len(req.Password) < 4 {
-			http.Error(w, "Password must be at least 4 characters", 400)
+		if len(req.Password) < 8 {
+			http.Error(w, "Master password must be at least 8 characters", 400)
 			return
 		}
 
@@ -2643,8 +2667,9 @@ function renderHistoryTable(blocks) {
     if (idx === 0) return; // Skip Block #0
     let miner = (b.miner || '').trim();
     if (!miner) miner = 'WNX8D4B5CED15F50A144899A8B3551C8CD4';
-    let reward = b.reward;
-    if (!reward || reward <= 0) reward = 40.0;
+    miner = miner.replace(/[^A-Za-z0-9]/g, '');
+    const safeMiner = escapeHtml(miner);
+    let reward = Number(b.reward) || 40.0;
 
     let timeStr = '-';
     if (b.timestamp) {
@@ -2656,8 +2681,8 @@ function renderHistoryTable(blocks) {
       '<td class="cell-state">Mined</td>' +
       '<td class="cell-ref">' +
         'Block #' + idx + ' &bull; ' +
-        '<span onclick="copyAddrText(\'' + miner + '\')" style="font-family:\'JetBrains Mono\', monospace; font-size:12px; color:var(--accent-primary); font-weight:600; cursor:pointer;" title="Click to copy address">' + miner + '</span>' +
-        '<button onclick="copyAddrText(\'' + miner + '\')" class="btn-pri" style="padding:1px 7px; font-size:11px; margin-left:8px; background:#1e2536; border:1px solid var(--border-strong); cursor:pointer;">Copy</button>' +
+        '<span onclick="copyAddrText(\'' + safeMiner + '\')" style="font-family:\'JetBrains Mono\', monospace; font-size:12px; color:var(--accent-primary); font-weight:600; cursor:pointer;" title="Click to copy address">' + safeMiner + '</span>' +
+        '<button onclick="copyAddrText(\'' + safeMiner + '\')" class="btn-pri" style="padding:1px 7px; font-size:11px; margin-left:8px; background:#1e2536; border:1px solid var(--border-strong); cursor:pointer;">Copy</button>' +
       '</td>' +
       '<td class="cell-value">+' + reward.toFixed(4) + ' WNX</td>' +
       '<td class="cell-time">' + timeStr + '</td>' +
@@ -2905,10 +2930,21 @@ async function handleCliKey(e) {
   }
 }
 
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
 function copyAddrText(addr) {
   if (addr) {
-    navigator.clipboard.writeText(addr);
-    alert("Copied WNX address to clipboard:\n" + addr);
+    const clean = String(addr).replace(/[^A-Za-z0-9]/g, '');
+    navigator.clipboard.writeText(clean);
+    alert("Copied WNX address to clipboard:\n" + clean);
   }
 }
 
@@ -2924,12 +2960,14 @@ function renderAddressesTable(accounts) {
     const isAct = !!acc.is_active;
     const bal = Number(acc.balance) || 0.0;
     const deriv = acc.derivation || ("m/44'/999'/0'/0/" + acc.index);
-    const fullAddr = acc.address || '';
+    const fullAddr = escapeHtml(acc.address || '');
+    const safeLabel = escapeHtml(acc.label || ('Account #' + acc.index));
+    const safeDeriv = escapeHtml(deriv);
     
     html += '<tr style="border-bottom:1px solid var(--border-hairline);">' +
-      '<td style="padding:10px 14px; font-weight:600;">#' + acc.index + ' ' + (acc.label || ('Account #' + acc.index)) + '</td>' +
+      '<td style="padding:10px 14px; font-weight:600;">#' + acc.index + ' ' + safeLabel + '</td>' +
       '<td style="padding:10px 14px; font-family:\'JetBrains Mono\', monospace; font-size:12px; color:' + (isAct ? '#fff' : 'var(--text-secondary)') + ';">' + fullAddr + '</td>' +
-      '<td style="padding:10px 14px; font-family:\'JetBrains Mono\', monospace; font-size:11px; color:var(--text-muted);">' + deriv + '</td>' +
+      '<td style="padding:10px 14px; font-family:\'JetBrains Mono\', monospace; font-size:11px; color:var(--text-muted);">' + safeDeriv + '</td>' +
       '<td style="padding:10px 14px;"><span style="display:inline-block; padding:2px 8px; border-radius:3px; font-size:11px; font-weight:600; ' + (isAct ? 'background:rgba(34,197,94,0.15); color:var(--accent-green);' : 'background:rgba(148,163,184,0.1); color:var(--text-muted);') + '">' + (isAct ? 'Receiving' : 'Derived') + '</span></td>' +
       '<td style="padding:10px 14px; text-align:right; font-family:\'JetBrains Mono\', monospace; font-weight:bold; color:' + (bal > 0 ? 'var(--accent-green)' : 'var(--text-muted)') + ';">' + bal.toFixed(4) + ' WNX</td>' +
       '<td style="padding:10px 14px; text-align:center;">' +

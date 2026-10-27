@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"winex-consensus"
 )
 
 // ==================== 1. UPNP IGD AUTOMATIC PORT FORWARDING ====================
@@ -172,7 +174,7 @@ func getLocalOutboundIP() string {
 
 const lanDiscoveryPort = 8082
 
-func StartLANAutoDiscovery(nodeEngine *NodeEngine, localListenPort int) {
+func StartLANAutoDiscovery(nodeEngine *consensus.NodeEngine, localListenPort int) {
 	// Broadcast announcer
 	go func() {
 		defer func() { _ = recover() }()
@@ -225,20 +227,9 @@ func StartLANAutoDiscovery(nodeEngine *NodeEngine, localListenPort int) {
 					remotePort, _ := strconv.Atoi(parts[2])
 					if remoteIP != localIP && remotePort > 0 {
 						peerURL := fmt.Sprintf("http://%s:%d", remoteIP, remotePort)
-						nodeEngine.mu.Lock()
-						exists := false
-						for _, p := range nodeEngine.state.Peers {
-							if p == peerURL {
-								exists = true
-								break
-							}
-						}
-						if !exists && len(nodeEngine.state.Peers) < 64 {
-							nodeEngine.state.Peers = append(nodeEngine.state.Peers, peerURL)
-							nodeEngine.saveToDisk()
+						if nodeEngine.AddPeerSafely(peerURL) {
 							fmt.Printf(" \033[38;2;16;185;129m[LAN Discovery]\033[0m Found peer on local network: %s\n", peerURL)
 						}
-						nodeEngine.mu.Unlock()
 					}
 				}
 			}
