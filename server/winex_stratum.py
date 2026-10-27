@@ -112,6 +112,7 @@ class StratumClient:
         self.authorized = False
         self.msg_count = 0
         self.last_msg_reset = time.time()
+        self._in_buffer = bytearray()
 
     async def send_json(self, data: dict):
         try:
@@ -140,19 +141,29 @@ class StratumClient:
         await self.send_json({"id": None, "method": "mining.notify", "params": params})
 
     async def read_line_bounded(self) -> Optional[bytes]:
-        """Reads stream with strict real-time byte chunk limiting to prevent OOM buffer bombs."""
-        buf = bytearray()
+        """Reads stream preserving leftover bytes from previous reads to support pipelined messages."""
         while True:
+            if b"\n" in self._in_buffer:
+                idx = self._in_buffer.index(b"\n")
+                line = bytes(self._in_buffer[:idx])
+                del self._in_buffer[:idx + 1]
+                if len(line) > MAX_FRAME_SIZE:
+                    logger.warning(f"Oversized frame from {self.client_ip} ({len(line)} bytes > {MAX_FRAME_SIZE}). Terminating connection.")
+                    return None
+                return line
+
+            if len(self._in_buffer) > MAX_FRAME_SIZE:
+                logger.warning(f"Oversized buffer from {self.client_ip} without newline ({len(self._in_buffer)} bytes). Terminating connection.")
+                return None
+
             chunk = await self.reader.read(128)
             if not chunk:
-                return None if not buf else bytes(buf)
-            buf.extend(chunk)
-            if len(buf) > MAX_FRAME_SIZE:
-                logger.warning(f"Oversized frame from {self.client_ip} ({len(buf)} bytes > {MAX_FRAME_SIZE}). Terminating connection.")
+                if self._in_buffer:
+                    line = bytes(self._in_buffer)
+                    self._in_buffer.clear()
+                    return line
                 return None
-            if b"\n" in chunk:
-                line, rest = buf.split(b"\n", 1)
-                return bytes(line)
+            self._in_buffer.extend(chunk)
 
     async def handle(self):
         global active_ip_counts, connected_miners

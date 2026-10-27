@@ -120,6 +120,36 @@ func IsSafePublicPeer(rawURL string) bool {
 	return true
 }
 
+// StorageWriter abstraction for injectable persistence and fault testing
+type StorageWriter interface {
+	WriteAtomic(path string, data []byte) error
+}
+
+type defaultStorageWriter struct{}
+
+func (d *defaultStorageWriter) WriteAtomic(path string, data []byte) error {
+	tmpPath := fmt.Sprintf("%s.tmp.%d", path, time.Now().UnixNano())
+	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
 // BlockchainState holds persistent ledger and memory state in satoshis
 type BlockchainState struct {
 	Blocks           []Block          `json:"blocks"`
@@ -137,6 +167,14 @@ type NodeEngine struct {
 	state          BlockchainState
 	dataPath       string
 	bootstrapNodes []string
+	storage        StorageWriter
+}
+
+// SetStorageWriter allows injecting a mock/fault storage writer for testing
+func (n *NodeEngine) SetStorageWriter(sw StorageWriter) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.storage = sw
 }
 
 // NewNodeEngine initializes the node state
@@ -147,6 +185,7 @@ func NewNodeEngine(dataPath string, bootstrap []string) *NodeEngine {
 	n := &NodeEngine{
 		dataPath:       dataPath,
 		bootstrapNodes: bootstrap,
+		storage:        &defaultStorageWriter{},
 		state: BlockchainState{
 			Blocks:           []Block{},
 			BalancesSat:      make(map[string]int64),
@@ -161,48 +200,91 @@ func NewNodeEngine(dataPath string, bootstrap []string) *NodeEngine {
 	return n
 }
 
-// ReplayAndVerifyLedger verifies block continuity, PoW and recomputes balances from scratch
-func (n *NodeEngine) ReplayAndVerifyLedger(blocks []Block) (map[string]int64, int64, error) {
+// ReplayAndVerifyLedger verifies block continuity, PoW, Merkle roots, signatures and recomputes balances from scratch
+func (n *NodeEngine) ReplayAndVerifyLedger(blocks []Block) (map[string]int64, int64, map[string]int64, error) {
 	if len(blocks) == 0 {
-		return nil, 0, errors.New("empty block chain")
+		return nil, 0, nil, errors.New("empty block chain")
 	}
 	if blocks[0].Hash != GenesisHash || blocks[0].Index != 0 {
-		return nil, 0, errors.New("genesis block mismatch")
+		return nil, 0, nil, errors.New("genesis block mismatch")
 	}
 
 	computedBalances := make(map[string]int64)
 	computedBalances[GenesisVaultAddr] = GenesisSupplySat
 	computedPool := InitialPoolSat
+	computedNonces := make(map[string]int64)
 
 	for i := 1; i < len(blocks); i++ {
 		prev := &blocks[i-1]
 		curr := &blocks[i]
 		if err := n.ValidateBlock(prev, curr); err != nil {
-			return nil, 0, fmt.Errorf("block #%d validation failed: %w", curr.Index, err)
+			return nil, 0, nil, fmt.Errorf("block #%d validation failed: %w", curr.Index, err)
+		}
+
+		// Verify Merkle Root matches transactions in block
+		expectedMerkle := ComputeMerkleRoot(curr.Txs)
+		if curr.MerkleRoot != expectedMerkle {
+			return nil, 0, nil, fmt.Errorf("block #%d merkle root mismatch: header %s, computed %s", curr.Index, curr.MerkleRoot, expectedMerkle)
+		}
+
+		// Verify Block Subsidy matches height protocol
+		expectedSubsidy := GetBlockRewardSat(curr.Index)
+		if curr.RewardSat > expectedSubsidy {
+			return nil, 0, nil, fmt.Errorf("block #%d subsidy %d exceeds protocol allowed %d", curr.Index, curr.RewardSat, expectedSubsidy)
 		}
 
 		reward := curr.RewardSat
 		if reward > computedPool {
 			reward = computedPool
 		}
-		computedBalances[curr.Miner] += reward
+
+		var totalBlockFees int64
+
+		// Replay and verify each transaction in block
+		for _, tx := range curr.Txs {
+			// Arithmetic overflow check on total cost
+			if tx.AmountSat <= 0 || tx.AmountSat > MaxSupplySat {
+				return nil, 0, nil, fmt.Errorf("block #%d transaction %s: invalid amount %d", curr.Index, tx.TxID, tx.AmountSat)
+			}
+			if tx.FeeSat < 0 || tx.FeeSat > 1000*SatoshiPerCoin {
+				return nil, 0, nil, fmt.Errorf("block #%d transaction %s: invalid fee %d", curr.Index, tx.TxID, tx.FeeSat)
+			}
+			if tx.AmountSat > (math.MaxInt64 - tx.FeeSat) {
+				return nil, 0, nil, fmt.Errorf("block #%d transaction %s: amount+fee overflow", curr.Index, tx.TxID)
+			}
+			totalCost := tx.AmountSat + tx.FeeSat
+
+			// Verify cryptographic signature
+			if err := VerifyTransactionSignature(&tx); err != nil {
+				return nil, 0, nil, fmt.Errorf("block #%d transaction %s signature invalid: %w", curr.Index, tx.TxID, err)
+			}
+
+			// Verify sender balance
+			if computedBalances[tx.Sender] < totalCost {
+				return nil, 0, nil, fmt.Errorf("block #%d transaction %s: insufficient balance for sender %s", curr.Index, tx.TxID, tx.Sender)
+			}
+
+			// Nonce ordering check
+			if tx.Nonce != 0 && tx.Nonce <= computedNonces[tx.Sender] {
+				return nil, 0, nil, fmt.Errorf("block #%d transaction %s: nonce %d must be > %d", curr.Index, tx.TxID, tx.Nonce, computedNonces[tx.Sender])
+			}
+			if tx.Nonce > 0 {
+				computedNonces[tx.Sender] = tx.Nonce
+			}
+
+			// Apply state transition
+			computedBalances[tx.Sender] -= totalCost
+			computedBalances[tx.Recipient] += tx.AmountSat
+			totalBlockFees += tx.FeeSat
+		}
+
+		computedBalances[curr.Miner] += (reward + totalBlockFees)
 		if computedPool >= reward {
 			computedPool -= reward
 		}
-
-		// Replay transactions in block
-		for _, tx := range curr.Txs {
-			totalCost := tx.AmountSat + tx.FeeSat
-			if computedBalances[tx.Sender] < totalCost {
-				return nil, 0, fmt.Errorf("block #%d transaction %s: insufficient balance for sender %s", curr.Index, tx.TxID, tx.Sender)
-			}
-			computedBalances[tx.Sender] -= totalCost
-			computedBalances[tx.Recipient] += tx.AmountSat
-			computedBalances[curr.Miner] += tx.FeeSat
-		}
 	}
 
-	return computedBalances, computedPool, nil
+	return computedBalances, computedPool, computedNonces, nil
 }
 
 // Load genesis or recover existing chain state with cryptographic audit
@@ -213,17 +295,17 @@ func (n *NodeEngine) loadOrInitGenesis() {
 		var s BlockchainState
 		if err := json.Unmarshal(b, &s); err == nil && len(s.Blocks) > 0 {
 			// Cryptographically replay and audit the chain before trusting in-memory state
-			verifiedBalances, verifiedPool, err := n.ReplayAndVerifyLedger(s.Blocks)
+			verifiedBalances, verifiedPool, verifiedNonces, err := n.ReplayAndVerifyLedger(s.Blocks)
 			if err != nil {
-				fmt.Printf("[SECURITY WARNING] Corrupted or manipulated chain in %s (%v). Quarantining corrupted file and resetting to canonical genesis.\n", n.dataPath, err)
-				_ = os.Rename(n.dataPath, fmt.Sprintf("%s.corrupted.%d", n.dataPath, time.Now().Unix()))
+				// Safely quarantine corrupted state without overwriting existing quarantine files
+				quarantinePath := fmt.Sprintf("%s.corrupted.%d", n.dataPath, time.Now().UnixNano())
+				fmt.Printf("[SECURITY WARNING] Corrupted chain in %s (%v). Quarantining to %s and initializing clean genesis.\n", n.dataPath, err, quarantinePath)
+				_ = os.Rename(n.dataPath, quarantinePath)
 			} else {
 				n.state = s
 				n.state.BalancesSat = verifiedBalances
 				n.state.PoolRemainingSat = verifiedPool
-				if n.state.AccountNonces == nil {
-					n.state.AccountNonces = make(map[string]int64)
-				}
+				n.state.AccountNonces = verifiedNonces
 				if n.state.SeenSigs == nil {
 					n.state.SeenSigs = make(map[string]int64)
 				}
@@ -254,37 +336,44 @@ func (n *NodeEngine) loadOrInitGenesis() {
 	_ = n.saveToDiskAtomic()
 }
 
-// Atomic file write using tmp + fsync + rename
+// Atomic file write using storage abstraction
 func (n *NodeEngine) saveToDiskAtomic() error {
-	tmpPath := fmt.Sprintf("%s.tmp.%d", n.dataPath, time.Now().UnixNano())
 	b, err := json.MarshalIndent(n.state, "", "  ")
 	if err != nil {
 		return err
 	}
-	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
-	if err != nil {
-		return err
+	if n.storage != nil {
+		return n.storage.WriteAtomic(n.dataPath, b)
 	}
-	if _, err := f.Write(b); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmpPath)
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmpPath)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmpPath)
-		return err
-	}
-	return os.Rename(tmpPath, n.dataPath)
+	d := &defaultStorageWriter{}
+	return d.WriteAtomic(n.dataPath, b)
 }
 
-// GetBalanceLocked returns balance from local ledger without locking
+// GetPendingReservedBalanceLocked returns total satoshis currently locked in mempool for sender
+func (n *NodeEngine) GetPendingReservedBalanceLocked(sender string) int64 {
+	var reserved int64
+	for _, tx := range n.state.Mempool {
+		if tx.Sender == sender {
+			reserved += (tx.AmountSat + tx.FeeSat)
+		}
+	}
+	return reserved
+}
+
+// GetBalanceLocked returns confirmed balance from local ledger without locking
 func (n *NodeEngine) GetBalanceLocked(addr string) int64 {
 	return n.state.BalancesSat[addr]
+}
+
+// GetSpendableBalanceLocked calculates confirmed balance minus pending mempool outgoing
+func (n *NodeEngine) GetSpendableBalanceLocked(addr string) int64 {
+	confirmed := n.state.BalancesSat[addr]
+	reserved := n.GetPendingReservedBalanceLocked(addr)
+	spendable := confirmed - reserved
+	if spendable < 0 {
+		return 0
+	}
+	return spendable
 }
 
 // GetBalance returns address balance computed strictly from verified local chain
@@ -464,13 +553,21 @@ func (n *NodeEngine) SubmitBlock(minerAddr string, index, nonce int64, ts float6
 		totalFeesSat += tx.FeeSat
 	}
 
+	// Apply confirmed transaction settlement now that block is committed
+	for _, tx := range blk.Txs {
+		n.state.BalancesSat[tx.Sender] -= (tx.AmountSat + tx.FeeSat)
+		n.state.BalancesSat[tx.Recipient] += tx.AmountSat
+	}
+
 	n.state.Blocks = append(n.state.Blocks, blk)
 	n.state.BalancesSat[minerAddr] += (rewardSat + totalFeesSat)
 	if n.state.PoolRemainingSat >= rewardSat {
 		n.state.PoolRemainingSat -= rewardSat
 	}
 	n.state.Mempool = []Transaction{}
-	_ = n.saveToDiskAtomic()
+	if err := n.saveToDiskAtomic(); err != nil {
+		return false, fmt.Sprintf("Persistence failure committing block: %v", err)
+	}
 
 	return true, fmt.Sprintf("Block #%d committed with %d txs and %d satoshis reward", index, len(blk.Txs), rewardSat+totalFeesSat)
 }
@@ -537,25 +634,23 @@ func (n *NodeEngine) AddTransaction(sender, recip string, amountSat, feeSat, non
 		return false, fmt.Sprintf("Nonce too low: expected %d, got %d", expectedNonce, nonce)
 	}
 
-	senderBalSat := n.GetBalanceLocked(sender)
-	if senderBalSat < totalReqSat {
-		return false, fmt.Sprintf("Insufficient balance: available %d satoshis, required %d satoshis", senderBalSat, totalReqSat)
+	// Spendable balance check: Confirmed balance minus all pending mempool transactions from sender
+	spendableBalSat := n.GetSpendableBalanceLocked(sender)
+	if spendableBalSat < totalReqSat {
+		return false, fmt.Sprintf("Insufficient spendable balance: available %d satoshis, required %d satoshis (pending locked: %d)",
+			spendableBalSat, totalReqSat, n.GetPendingReservedBalanceLocked(sender))
 	}
 
-	// Recipient balance overflow check
-	recipBalSat := n.GetBalanceLocked(recip)
-	if recipBalSat > (MaxSupplySat - amountSat) {
+	// Recipient balance overflow check against confirmed balance
+	confirmedRecipBalSat := n.state.BalancesSat[recip]
+	if confirmedRecipBalSat > (MaxSupplySat - amountSat) {
 		return false, "Recipient balance overflow: cannot exceed maximum supply"
 	}
 
-	// Atomic state transition with rollback if persistence fails
-	prevSenderBal := n.state.BalancesSat[sender]
-	prevRecipBal := n.state.BalancesSat[recip]
+	// Atomic state transition: Mempool reservation only, Confirmed ledger is NOT mutated
 	prevNonce := n.state.AccountNonces[sender]
 	prevSeenSig, hadSeenSig := n.state.SeenSigs[sig]
 
-	n.state.BalancesSat[sender] -= totalReqSat
-	n.state.BalancesSat[recip] += amountSat
 	if nonce >= expectedNonce {
 		n.state.AccountNonces[sender] = nonce
 	}
@@ -564,8 +659,6 @@ func (n *NodeEngine) AddTransaction(sender, recip string, amountSat, feeSat, non
 
 	if err := n.saveToDiskAtomic(); err != nil {
 		// Rollback in-memory state on persistence failure
-		n.state.BalancesSat[sender] = prevSenderBal
-		n.state.BalancesSat[recip] = prevRecipBal
 		n.state.AccountNonces[sender] = prevNonce
 		if hadSeenSig {
 			n.state.SeenSigs[sig] = prevSeenSig
