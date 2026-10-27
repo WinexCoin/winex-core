@@ -57,14 +57,25 @@ def check_api_rate_limit(ip: str, action: str, max_requests: int, window_sec: fl
 
 @app.middleware("http")
 async def security_and_auth_gate(request: Request, call_next):
-    # Enforce request body size limits to block OOM & HTTP flood attacks
-    content_len = request.headers.get("content-length")
-    if content_len:
-        try:
-            if int(content_len) > 2 * 1024 * 1024:
-                return Response(content="Payload Too Large", status_code=413)
-        except ValueError:
-            pass
+    # Enforce request body size limits to block OOM & HTTP flood attacks (both Content-Length and chunked)
+    if request.method in ("POST", "PUT", "PATCH"):
+        content_len = request.headers.get("content-length")
+        if content_len:
+            try:
+                if int(content_len) > 2 * 1024 * 1024:
+                    return Response(content="Payload Too Large", status_code=413)
+            except ValueError:
+                return Response(content="Bad Request", status_code=400)
+        else:
+            MAX_BODY = 2 * 1024 * 1024
+            body_parts = []
+            total_bytes = 0
+            async for chunk in request.stream():
+                total_bytes += len(chunk)
+                if total_bytes > MAX_BODY:
+                    return Response(content="Payload Too Large", status_code=413)
+                body_parts.append(chunk)
+            request._body = b"".join(body_parts)
 
     if request.method == "POST":
         # Only trust cf-connecting-ip if client connection originates from localhost proxy or trusted Cloudflare IP

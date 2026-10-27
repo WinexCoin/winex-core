@@ -647,6 +647,11 @@ func main() {
 				hSalt := sha256.Sum256([]byte(minerAddr + saltPrefix))
 				saltHex := hex.EncodeToString(hSalt[:])
 
+				if !ValidateMiningJobInputs(prefixStr, saltHex, targetHex) {
+					time.Sleep(50 * time.Millisecond)
+					continue
+				}
+
 				found, solvedNonce, solvedHash := RunGPUBatch(prefixStr, saltHex, targetHex, currentNonce, batchSize)
 				atomic.AddUint64(&totalHashes, uint64(batchSize))
 				currentNonce += uint64(batchSize)
@@ -722,6 +727,11 @@ func main() {
 					hSalt := sha256.Sum256([]byte(minerAddr + saltPrefix))
 					var saltHex [64]byte
 					hex.Encode(saltHex[:], hSalt[:])
+
+					if !ValidateMiningJobInputs(prefixStr, string(saltHex[:]), targetHex) {
+						time.Sleep(100 * time.Millisecond)
+						continue
+					}
 
 					var buf [384]byte
 					copy(buf[:], prefixBytes)

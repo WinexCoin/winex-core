@@ -277,23 +277,6 @@ func IsNativeGPUAvailable() (bool, string) {
 	return false, ""
 }
 
-func ValidateMiningJobInputs(prefix, saltHex, targetHex string) bool {
-	// Prefix format: index:prev_hash:merkle:miner:timestamp:
-	// Target buffer in OpenCL kernel is 384 bytes, with 32 bytes reserved for nonce string
-	if len(prefix) == 0 || len(prefix) > 340 {
-		return false
-	}
-	// Salt must be exact 64-char hex
-	if len(saltHex) != 64 {
-		return false
-	}
-	// Target must be exact 64-char hex
-	if len(targetHex) != 64 {
-		return false
-	}
-	return true
-}
-
 func RunGPUBatch(prefix, saltHex, targetHex string, startNonce uint64, batchSize uint32) (bool, uint64, string) {
 	if !ValidateMiningJobInputs(prefix, saltHex, targetHex) {
 		return false, 0, ""

@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"math"
+	"math/big"
 	"testing"
 	"time"
 
@@ -83,26 +85,29 @@ func TestReplayAndVerifyLedgerTamperDetection(t *testing.T) {
 	tmpDir := t.TempDir()
 	stateFile := tmpDir + "/replay_test.json"
 	engine := NewNodeEngine(stateFile, nil)
+	testTarget := "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	engine.SetTargetHex(testTarget)
 
 	// Mine a valid Block #1
 	prevHash := GenesisHash
 	merkle := ComputeMerkleRoot([]Transaction{})
 	minerAddr := "WNXAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-	ts := 1740000100.0
+	ts := float64(time.Now().Unix())
 
-	// Find valid nonce with "000000" prefix
+	targetInt, _ := new(big.Int).SetString(testTarget, 16)
 	var validNonce int64 = -1
 	var validHash string
-	for n := int64(0); n < 5000000; n++ {
+	for n := int64(0); n < 100000; n++ {
 		h := ComputePowHash(1, prevHash, merkle, minerAddr, ts, n)
-		if h[:6] == "000000" {
+		hInt, _ := new(big.Int).SetString(h, 16)
+		if hInt.Cmp(targetInt) < 0 {
 			validNonce = n
 			validHash = h
 			break
 		}
 	}
 	if validNonce == -1 {
-		t.Skip("Could not find PoW solution quickly in test environment")
+		t.Fatalf("Failed to find valid test PoW solution")
 	}
 
 	ok, msg := engine.SubmitBlock(minerAddr, 1, validNonce, ts, validHash)
@@ -111,15 +116,41 @@ func TestReplayAndVerifyLedgerTamperDetection(t *testing.T) {
 	}
 
 	// 1. TAMPER TEST: Modify miner reward to create unearned coins
-	tamperedBlocks := make([]Block, len(engine.state.Blocks))
-	copy(tamperedBlocks, engine.state.Blocks)
-	tamperedBlocks[1].RewardSat += 100 * SatoshiPerCoin // illegal extra subsidy
-	_, _, _, err := engine.ReplayAndVerifyLedger(tamperedBlocks)
+	tamperedBlocks1 := make([]Block, len(engine.state.Blocks))
+	copy(tamperedBlocks1, engine.state.Blocks)
+	tamperedBlocks1[1].RewardSat += 100 * SatoshiPerCoin // illegal extra subsidy
+	_, _, _, err := engine.ReplayAndVerifyLedger(tamperedBlocks1)
 	if err == nil {
-		t.Fatalf("Expected ReplayAndVerifyLedger to reject tampered block subsidy!")
+		t.Fatalf("Expected ReplayAndVerifyLedger to reject tampered excessive block subsidy!")
 	}
 
-	// 2. TAMPER TEST: Modify transaction list without updating merkle root
+	// 2. TAMPER TEST: Negative subsidy exploit attempt
+	tamperedBlocksNeg := make([]Block, len(engine.state.Blocks))
+	copy(tamperedBlocksNeg, engine.state.Blocks)
+	tamperedBlocksNeg[1].RewardSat = -100000000
+	_, _, _, err = engine.ReplayAndVerifyLedger(tamperedBlocksNeg)
+	if err == nil {
+		t.Fatalf("Expected ReplayAndVerifyLedger to reject negative subsidy!")
+	}
+
+	tamperedBlocksMinInt := make([]Block, len(engine.state.Blocks))
+	copy(tamperedBlocksMinInt, engine.state.Blocks)
+	tamperedBlocksMinInt[1].RewardSat = math.MinInt64
+	_, _, _, err = engine.ReplayAndVerifyLedger(tamperedBlocksMinInt)
+	if err == nil {
+		t.Fatalf("Expected ReplayAndVerifyLedger to reject math.MinInt64 subsidy!")
+	}
+
+	// 3. TAMPER TEST: TxCount header mismatch
+	tamperedBlocksTxCount := make([]Block, len(engine.state.Blocks))
+	copy(tamperedBlocksTxCount, engine.state.Blocks)
+	tamperedBlocksTxCount[1].TxCount = 99
+	_, _, _, err = engine.ReplayAndVerifyLedger(tamperedBlocksTxCount)
+	if err == nil {
+		t.Fatalf("Expected ReplayAndVerifyLedger to reject TxCount mismatch!")
+	}
+
+	// 4. TAMPER TEST: Modify transaction list without updating merkle root
 	tamperedBlocks2 := make([]Block, len(engine.state.Blocks))
 	copy(tamperedBlocks2, engine.state.Blocks)
 	tamperedBlocks2[1].Txs = append(tamperedBlocks2[1].Txs, Transaction{
@@ -128,6 +159,54 @@ func TestReplayAndVerifyLedgerTamperDetection(t *testing.T) {
 	_, _, _, err = engine.ReplayAndVerifyLedger(tamperedBlocks2)
 	if err == nil {
 		t.Fatalf("Expected ReplayAndVerifyLedger to reject block with merkle mismatch!")
+	}
+}
+
+func TestSubmitBlockPersistenceFailureRollback(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFile := tmpDir + "/submit_rollback_mock.json"
+	engine := NewNodeEngine(stateFile, nil)
+	testTarget := "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	engine.SetTargetHex(testTarget)
+
+	minerAddr := "WNXAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	prevHash := GenesisHash
+	merkle := ComputeMerkleRoot([]Transaction{})
+	ts := float64(time.Now().Unix())
+
+	targetInt, _ := new(big.Int).SetString(testTarget, 16)
+	var validNonce int64 = -1
+	var validHash string
+	for n := int64(0); n < 100000; n++ {
+		h := ComputePowHash(1, prevHash, merkle, minerAddr, ts, n)
+		hInt, _ := new(big.Int).SetString(h, 16)
+		if hInt.Cmp(targetInt) < 0 {
+			validNonce = n
+			validHash = h
+			break
+		}
+	}
+	if validNonce == -1 {
+		t.Fatalf("Could not find test PoW")
+	}
+
+	// Inject failing storage writer
+	engine.SetStorageWriter(&failStorageWriter{})
+
+	origBlocksLen := len(engine.state.Blocks)
+	origMinerBal := engine.GetBalanceLocked(minerAddr)
+
+	ok, msg := engine.SubmitBlock(minerAddr, 1, validNonce, ts, validHash)
+	if ok {
+		t.Fatalf("SubmitBlock should have failed due to storage error, got success: %s", msg)
+	}
+
+	// State must be completely unmodified
+	if len(engine.state.Blocks) != origBlocksLen {
+		t.Fatalf("Blocks slice was modified despite persistence failure: got %d, expected %d", len(engine.state.Blocks), origBlocksLen)
+	}
+	if engine.GetBalanceLocked(minerAddr) != origMinerBal {
+		t.Fatalf("Miner balance was modified despite persistence failure: got %d, expected %d", engine.GetBalanceLocked(minerAddr), origMinerBal)
 	}
 }
 

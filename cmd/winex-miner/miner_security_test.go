@@ -70,4 +70,20 @@ func TestValidateMiningJobInputs(t *testing.T) {
 	if ValidateMiningJobInputs(validPrefix, validSalt, "short_target") {
 		t.Fatalf("Expected short target to be rejected")
 	}
+
+	// Non-hex characters in salt or target
+	invalidHexSalt := strings.Repeat("z", 64)
+	if ValidateMiningJobInputs(validPrefix, invalidHexSalt, validTarget) {
+		t.Fatalf("Expected non-hex salt to be rejected")
+	}
+
+	invalidHexTarget := strings.Repeat("g", 64)
+	if ValidateMiningJobInputs(validPrefix, validSalt, invalidHexTarget) {
+		t.Fatalf("Expected non-hex target to be rejected")
+	}
+
+	// Empty prefix
+	if ValidateMiningJobInputs("", validSalt, validTarget) {
+		t.Fatalf("Expected empty prefix to be rejected")
+	}
 }

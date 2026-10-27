@@ -168,6 +168,7 @@ type NodeEngine struct {
 	dataPath       string
 	bootstrapNodes []string
 	storage        StorageWriter
+	targetHex      string
 }
 
 // SetStorageWriter allows injecting a mock/fault storage writer for testing
@@ -175,6 +176,20 @@ func (n *NodeEngine) SetStorageWriter(sw StorageWriter) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.storage = sw
+}
+
+// SetTargetHex allows overriding PoW target for testing and isolated networks
+func (n *NodeEngine) SetTargetHex(target string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.targetHex = target
+}
+
+func (n *NodeEngine) getTargetHexLocked() string {
+	if n.targetHex != "" {
+		return n.targetHex
+	}
+	return defaultTargetHex
 }
 
 // NewNodeEngine initializes the node state
@@ -221,13 +236,21 @@ func (n *NodeEngine) ReplayAndVerifyLedger(blocks []Block) (map[string]int64, in
 			return nil, 0, nil, fmt.Errorf("block #%d validation failed: %w", curr.Index, err)
 		}
 
+		// Verify TxCount matches actual transactions in block
+		if curr.TxCount != len(curr.Txs) {
+			return nil, 0, nil, fmt.Errorf("block #%d tx_count mismatch: header %d, actual %d", curr.Index, curr.TxCount, len(curr.Txs))
+		}
+
 		// Verify Merkle Root matches transactions in block
 		expectedMerkle := ComputeMerkleRoot(curr.Txs)
 		if curr.MerkleRoot != expectedMerkle {
 			return nil, 0, nil, fmt.Errorf("block #%d merkle root mismatch: header %s, computed %s", curr.Index, curr.MerkleRoot, expectedMerkle)
 		}
 
-		// Verify Block Subsidy matches height protocol
+		// Verify Block Subsidy matches height protocol: strictly non-negative and <= expected
+		if curr.RewardSat < 0 {
+			return nil, 0, nil, fmt.Errorf("block #%d negative subsidy rejected: %d satoshis", curr.Index, curr.RewardSat)
+		}
 		expectedSubsidy := GetBlockRewardSat(curr.Index)
 		if curr.RewardSat > expectedSubsidy {
 			return nil, 0, nil, fmt.Errorf("block #%d subsidy %d exceeds protocol allowed %d", curr.Index, curr.RewardSat, expectedSubsidy)
@@ -254,6 +277,12 @@ func (n *NodeEngine) ReplayAndVerifyLedger(blocks []Block) (map[string]int64, in
 			}
 			totalCost := tx.AmountSat + tx.FeeSat
 
+			// Verify Canonical TxID matches computed TxID
+			computedTxID := ComputeTxID(ChainID, tx.Sender, tx.Recipient, tx.AmountSat, tx.FeeSat, tx.Nonce, tx.Timestamp)
+			if tx.TxID != computedTxID {
+				return nil, 0, nil, fmt.Errorf("block #%d transaction %s: TxID mismatch (expected %s)", curr.Index, tx.TxID, computedTxID)
+			}
+
 			// Verify cryptographic signature
 			if err := VerifyTransactionSignature(&tx); err != nil {
 				return nil, 0, nil, fmt.Errorf("block #%d transaction %s signature invalid: %w", curr.Index, tx.TxID, err)
@@ -272,13 +301,24 @@ func (n *NodeEngine) ReplayAndVerifyLedger(blocks []Block) (map[string]int64, in
 				computedNonces[tx.Sender] = tx.Nonce
 			}
 
-			// Apply state transition
+			// Apply state transition with checked arithmetic
 			computedBalances[tx.Sender] -= totalCost
+			if computedBalances[tx.Recipient] > (MaxSupplySat - tx.AmountSat) {
+				return nil, 0, nil, fmt.Errorf("block #%d transaction %s: recipient balance overflow", curr.Index, tx.TxID)
+			}
 			computedBalances[tx.Recipient] += tx.AmountSat
+
+			if totalBlockFees > (math.MaxInt64 - tx.FeeSat) {
+				return nil, 0, nil, fmt.Errorf("block #%d total fees overflow", curr.Index)
+			}
 			totalBlockFees += tx.FeeSat
 		}
 
-		computedBalances[curr.Miner] += (reward + totalBlockFees)
+		minerTotalReward := reward + totalBlockFees
+		if computedBalances[curr.Miner] > (MaxSupplySat - minerTotalReward) {
+			return nil, 0, nil, fmt.Errorf("block #%d miner balance overflow", curr.Index)
+		}
+		computedBalances[curr.Miner] += minerTotalReward
 		if computedPool >= reward {
 			computedPool -= reward
 		}
@@ -336,9 +376,35 @@ func (n *NodeEngine) loadOrInitGenesis() {
 	_ = n.saveToDiskAtomic()
 }
 
-// Atomic file write using storage abstraction
-func (n *NodeEngine) saveToDiskAtomic() error {
-	b, err := json.MarshalIndent(n.state, "", "  ")
+// cloneStateLocked returns a deep copy of the in-memory BlockchainState
+func (n *NodeEngine) cloneStateLocked() BlockchainState {
+	st := BlockchainState{
+		Blocks:           make([]Block, len(n.state.Blocks)),
+		BalancesSat:      make(map[string]int64, len(n.state.BalancesSat)),
+		PoolRemainingSat: n.state.PoolRemainingSat,
+		AccountNonces:    make(map[string]int64, len(n.state.AccountNonces)),
+		Mempool:          make([]Transaction, len(n.state.Mempool)),
+		SeenSigs:         make(map[string]int64, len(n.state.SeenSigs)),
+		Peers:            make([]string, len(n.state.Peers)),
+	}
+	copy(st.Blocks, n.state.Blocks)
+	for k, v := range n.state.BalancesSat {
+		st.BalancesSat[k] = v
+	}
+	for k, v := range n.state.AccountNonces {
+		st.AccountNonces[k] = v
+	}
+	copy(st.Mempool, n.state.Mempool)
+	for k, v := range n.state.SeenSigs {
+		st.SeenSigs[k] = v
+	}
+	copy(st.Peers, n.state.Peers)
+	return st
+}
+
+// saveStateToDiskAtomic persists the provided state atomically to disk
+func (n *NodeEngine) saveStateToDiskAtomic(state *BlockchainState) error {
+	b, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -347,6 +413,11 @@ func (n *NodeEngine) saveToDiskAtomic() error {
 	}
 	d := &defaultStorageWriter{}
 	return d.WriteAtomic(n.dataPath, b)
+}
+
+// Atomic file write using storage abstraction
+func (n *NodeEngine) saveToDiskAtomic() error {
+	return n.saveStateToDiskAtomic(&n.state)
 }
 
 // GetPendingReservedBalanceLocked returns total satoshis currently locked in mempool for sender
@@ -489,12 +560,10 @@ func (n *NodeEngine) ValidateBlock(prev *Block, blk *Block) error {
 	if computedHash != blk.Hash {
 		return fmt.Errorf("computed hash %s does not match block hash %s", computedHash, blk.Hash)
 	}
-	if !strings.HasPrefix(computedHash, "000000") {
-		return errors.New("block hash does not satisfy required difficulty target")
-	}
 
 	// Target check with big.Int
-	targetInt, _ := new(big.Int).SetString(defaultTargetHex, 16)
+	targetHex := n.getTargetHexLocked()
+	targetInt, _ := new(big.Int).SetString(targetHex, 16)
 	hashInt, _ := new(big.Int).SetString(computedHash, 16)
 	if hashInt.Cmp(targetInt) >= 0 {
 		return errors.New("block hash exceeds numerical target")
@@ -553,22 +622,27 @@ func (n *NodeEngine) SubmitBlock(minerAddr string, index, nonce int64, ts float6
 		totalFeesSat += tx.FeeSat
 	}
 
+	// Atomic Staged Commit: clone state, apply mutations to staged copy
+	staged := n.cloneStateLocked()
+
 	// Apply confirmed transaction settlement now that block is committed
 	for _, tx := range blk.Txs {
-		n.state.BalancesSat[tx.Sender] -= (tx.AmountSat + tx.FeeSat)
-		n.state.BalancesSat[tx.Recipient] += tx.AmountSat
+		staged.BalancesSat[tx.Sender] -= (tx.AmountSat + tx.FeeSat)
+		staged.BalancesSat[tx.Recipient] += tx.AmountSat
 	}
 
-	n.state.Blocks = append(n.state.Blocks, blk)
-	n.state.BalancesSat[minerAddr] += (rewardSat + totalFeesSat)
-	if n.state.PoolRemainingSat >= rewardSat {
-		n.state.PoolRemainingSat -= rewardSat
+	staged.Blocks = append(staged.Blocks, blk)
+	staged.BalancesSat[minerAddr] += (rewardSat + totalFeesSat)
+	if staged.PoolRemainingSat >= rewardSat {
+		staged.PoolRemainingSat -= rewardSat
 	}
-	n.state.Mempool = []Transaction{}
-	if err := n.saveToDiskAtomic(); err != nil {
+	staged.Mempool = []Transaction{}
+
+	if err := n.saveStateToDiskAtomic(&staged); err != nil {
 		return false, fmt.Sprintf("Persistence failure committing block: %v", err)
 	}
 
+	n.state = staged
 	return true, fmt.Sprintf("Block #%d committed with %d txs and %d satoshis reward", index, len(blk.Txs), rewardSat+totalFeesSat)
 }
 
@@ -647,28 +721,19 @@ func (n *NodeEngine) AddTransaction(sender, recip string, amountSat, feeSat, non
 		return false, "Recipient balance overflow: cannot exceed maximum supply"
 	}
 
-	// Atomic state transition: Mempool reservation only, Confirmed ledger is NOT mutated
-	prevNonce := n.state.AccountNonces[sender]
-	prevSeenSig, hadSeenSig := n.state.SeenSigs[sig]
-
+	// Atomic staged commit: clone state, update staged copy, persist, and swap
+	staged := n.cloneStateLocked()
 	if nonce >= expectedNonce {
-		n.state.AccountNonces[sender] = nonce
+		staged.AccountNonces[sender] = nonce
 	}
-	n.state.SeenSigs[sig] = now + 86400 // Store for 24h window
-	n.state.Mempool = append(n.state.Mempool, tx)
+	staged.SeenSigs[sig] = now + 86400 // Store for 24h window
+	staged.Mempool = append(staged.Mempool, tx)
 
-	if err := n.saveToDiskAtomic(); err != nil {
-		// Rollback in-memory state on persistence failure
-		n.state.AccountNonces[sender] = prevNonce
-		if hadSeenSig {
-			n.state.SeenSigs[sig] = prevSeenSig
-		} else {
-			delete(n.state.SeenSigs, sig)
-		}
-		n.state.Mempool = n.state.Mempool[:len(n.state.Mempool)-1]
+	if err := n.saveStateToDiskAtomic(&staged); err != nil {
 		return false, fmt.Sprintf("State persistence failure: %v", err)
 	}
 
+	n.state = staged
 	return true, tx.TxID
 }
 
