@@ -8,6 +8,9 @@
 | **Target Block Interval** | **15.0 Minutes** (900s) | Calibrated for network propagation and low uncle rate |
 | **Initial Block Subsidy** | **40.0 WNX** | Distributed exclusively to valid PoW miners |
 | **Halving Schedule** | **125,000 Blocks** | Block subsidy halves every ~3.56 years |
+| **PoW Mining Pool** | **10,000,000 WNX** | 100% reserved for block discovery rewards |
+| **Genesis Ecosystem Vault** | **2,100,000 WNX** | Ecosystem reserve, liquidity provisioning & grants |
+| **Max Supply Hard Cap** | **12,100,000 WNX** | Hardcoded immutable consensus limit |
 | **Minimum Unit** | **0.00000001 WNX** | Fractional divisibility (8 decimal precision, Satoshi equivalent) |
 | **Difficulty Retargeting** | **Window: 20 Blocks** | Dynamic retargeting with Emergency Difficulty Adjustment (EDA) |
 

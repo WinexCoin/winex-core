@@ -169,6 +169,19 @@ type NodeEngine struct {
 	bootstrapNodes []string
 	storage        StorageWriter
 	targetHex      string
+	wallet         *NodeWallet
+}
+
+// GetWallet returns the underlying NodeWallet instance
+func (n *NodeEngine) GetWallet() *NodeWallet {
+	return n.wallet
+}
+
+// SetWallet attaches a NodeWallet to the node engine
+func (n *NodeEngine) SetWallet(w *NodeWallet) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.wallet = w
 }
 
 // SetStorageWriter allows injecting a mock/fault storage writer for testing
@@ -669,6 +682,9 @@ func (n *NodeEngine) AddTransaction(sender, recip string, amountSat, feeSat, non
 	totalReqSat := amountSat + feeSat
 
 	now := time.Now().Unix()
+	if ts <= 0 {
+		ts = now
+	}
 	if ts < now-86400 || ts > now+7200 {
 		return false, "Transaction timestamp drift out of bounds"
 	}
@@ -780,4 +796,234 @@ func (n *NodeEngine) GetBlocks(limit int) []Block {
 		blks = append(blks, n.state.Blocks[i])
 	}
 	return blks
+}
+
+// GetBlockByHashOrHeight finds block by height number or 64-hex hash
+func (n *NodeEngine) GetBlockByHashOrHeight(ref string) (*Block, int64) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+
+	ref = strings.TrimSpace(ref)
+	total := int64(len(n.state.Blocks))
+	for idx, b := range n.state.Blocks {
+		if fmt.Sprintf("%d", b.Index) == ref || strings.EqualFold(b.Hash, ref) {
+			bCopy := b
+			confs := total - int64(idx)
+			return &bCopy, confs
+		}
+	}
+	return nil, 0
+}
+
+// GetTransactionByID searches confirmed blocks and mempool for a tx
+func (n *NodeEngine) GetTransactionByID(txID string) (map[string]interface{}, bool) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+
+	txID = strings.TrimSpace(txID)
+	totalHeight := int64(len(n.state.Blocks))
+
+	// 1. Check Mempool
+	for _, tx := range n.state.Mempool {
+		if strings.EqualFold(tx.TxID, txID) {
+			return map[string]interface{}{
+				"tx_id":         tx.TxID,
+				"sender":        tx.Sender,
+				"recipient":     tx.Recipient,
+				"amount_sat":    tx.AmountSat,
+				"amount":        float64(tx.AmountSat) / float64(SatoshiPerCoin),
+				"fee_sat":       tx.FeeSat,
+				"fee":           float64(tx.FeeSat) / float64(SatoshiPerCoin),
+				"timestamp":     tx.Timestamp,
+				"confirmations": 0,
+				"status":        "unconfirmed",
+			}, true
+		}
+	}
+
+	// 2. Check Confirmed Blocks
+	for _, b := range n.state.Blocks {
+		for _, tx := range b.Txs {
+			if strings.EqualFold(tx.TxID, txID) {
+				confs := totalHeight - b.Index
+				if confs < 1 {
+					confs = 1
+				}
+				return map[string]interface{}{
+					"tx_id":         tx.TxID,
+					"block_index":   b.Index,
+					"block_hash":    b.Hash,
+					"sender":        tx.Sender,
+					"recipient":     tx.Recipient,
+					"amount_sat":    tx.AmountSat,
+					"amount":        float64(tx.AmountSat) / float64(SatoshiPerCoin),
+					"fee_sat":       tx.FeeSat,
+					"fee":           float64(tx.FeeSat) / float64(SatoshiPerCoin),
+					"timestamp":     tx.Timestamp,
+					"confirmations": confs,
+					"status":        "confirmed",
+				}, true
+			}
+		}
+	}
+	return nil, false
+}
+
+// GetAddressTransactions returns all incoming/outgoing transactions for an address
+func (n *NodeEngine) GetAddressTransactions(addr string, limit int) []map[string]interface{} {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+
+	addr = strings.TrimSpace(addr)
+	if limit <= 0 || limit > 500 {
+		limit = 50
+	}
+	totalHeight := int64(len(n.state.Blocks))
+	var res []map[string]interface{}
+
+	// Pending mempool first
+	for _, tx := range n.state.Mempool {
+		if tx.Sender == addr || tx.Recipient == addr {
+			res = append(res, map[string]interface{}{
+				"tx_id":         tx.TxID,
+				"sender":        tx.Sender,
+				"recipient":     tx.Recipient,
+				"amount":        float64(tx.AmountSat) / float64(SatoshiPerCoin),
+				"amount_sat":    tx.AmountSat,
+				"fee":           float64(tx.FeeSat) / float64(SatoshiPerCoin),
+				"timestamp":     tx.Timestamp,
+				"confirmations": 0,
+				"category":      map[bool]string{true: "receive", false: "send"}[tx.Recipient == addr],
+				"status":        "unconfirmed",
+			})
+		}
+	}
+
+	// Confirmed blocks backwards (newest first)
+	for i := len(n.state.Blocks) - 1; i >= 0 && len(res) < limit; i-- {
+		b := n.state.Blocks[i]
+		confs := totalHeight - b.Index
+		if confs < 1 {
+			confs = 1
+		}
+		for _, tx := range b.Txs {
+			if tx.Sender == addr || tx.Recipient == addr {
+				res = append(res, map[string]interface{}{
+					"tx_id":         tx.TxID,
+					"block_index":   b.Index,
+					"block_hash":    b.Hash,
+					"sender":        tx.Sender,
+					"recipient":     tx.Recipient,
+					"amount":        float64(tx.AmountSat) / float64(SatoshiPerCoin),
+					"amount_sat":    tx.AmountSat,
+					"fee":           float64(tx.FeeSat) / float64(SatoshiPerCoin),
+					"timestamp":     tx.Timestamp,
+					"confirmations": confs,
+					"category":      map[bool]string{true: "receive", false: "send"}[tx.Recipient == addr],
+					"status":        "confirmed",
+				})
+				if len(res) >= limit {
+					break
+				}
+			}
+		}
+	}
+	return res
+}
+
+// GetReceivedByAddress computes total confirmed incoming funds for a deposit address
+func (n *NodeEngine) GetReceivedByAddress(addr string, minConf int64) (float64, int64) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+
+	addr = strings.TrimSpace(addr)
+	if minConf <= 0 {
+		minConf = 1
+	}
+	totalHeight := int64(len(n.state.Blocks))
+	var totalSat int64
+
+	for _, b := range n.state.Blocks {
+		confs := totalHeight - b.Index
+		if confs < minConf {
+			continue
+		}
+		for _, tx := range b.Txs {
+			if tx.Recipient == addr {
+				totalSat += tx.AmountSat
+			}
+		}
+	}
+	return float64(totalSat) / float64(SatoshiPerCoin), totalSat
+}
+
+// SendFromWallet transfers coins from managed wallet to recipient address
+func (n *NodeEngine) SendFromWallet(fromAddr, toAddr string, amountSat int64, feeSat int64) (string, error) {
+	if n.wallet == nil {
+		return "", errors.New("node wallet is not initialized")
+	}
+	if !ValidateAddress(toAddr) {
+		return "", errors.New("invalid destination address")
+	}
+	if amountSat <= 0 {
+		return "", errors.New("amount must be greater than zero")
+	}
+	if feeSat < 0 {
+		feeSat = 0
+	}
+
+	n.mu.RLock()
+	// If fromAddr not specified, pick first managed address with sufficient balance
+	managedAddrs := n.wallet.GetAddresses()
+	if len(managedAddrs) == 0 {
+		n.mu.RUnlock()
+		return "", errors.New("wallet has no managed addresses (use getnewaddress first)")
+	}
+
+	var sender string
+	totalReq := amountSat + feeSat
+	if fromAddr != "" {
+		if !n.wallet.HasAddress(fromAddr) {
+			n.mu.RUnlock()
+			return "", fmt.Errorf("sender address %s not found in wallet", fromAddr)
+		}
+		spendable := n.GetSpendableBalanceLocked(fromAddr)
+		if spendable < totalReq {
+			n.mu.RUnlock()
+			return "", fmt.Errorf("insufficient spendable balance on %s: available %d sat, need %d sat", fromAddr, spendable, totalReq)
+		}
+		sender = fromAddr
+	} else {
+		for _, a := range managedAddrs {
+			if a == toAddr {
+				continue
+			}
+			if n.GetSpendableBalanceLocked(a) >= totalReq {
+				sender = a
+				break
+			}
+		}
+		if sender == "" {
+			n.mu.RUnlock()
+			return "", fmt.Errorf("no address in wallet has sufficient spendable balance for %d satoshis", totalReq)
+		}
+	}
+
+	nonce := n.state.AccountNonces[sender] + 1
+	n.mu.RUnlock()
+
+	ts := time.Now().Unix()
+	canonicalMsg := CanonicalTxPayload(ChainID, sender, toAddr, amountSat, feeSat, nonce, ts)
+	sigHex, pubHex, err := n.wallet.SignCanonicalTransaction(sender, canonicalMsg)
+	if err != nil {
+		return "", fmt.Errorf("signing failed: %w", err)
+	}
+
+	ok, msg := n.AddTransaction(sender, toAddr, amountSat, feeSat, nonce, ts, pubHex, sigHex)
+	if !ok {
+		return "", fmt.Errorf("transaction rejected by consensus: %s", msg)
+	}
+
+	txID := ComputeTxID(ChainID, sender, toAddr, amountSat, feeSat, nonce, ts)
+	return txID, nil
 }

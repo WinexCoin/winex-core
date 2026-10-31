@@ -96,6 +96,9 @@ flowchart TD
 | **Target Block Interval** | 15.0 Minutes (900 seconds) |
 | **Initial Block Reward** | 40.0 WNX |
 | **Halving Schedule** | Every 125,000 blocks (~3.56 years) |
+| **Mineable Subsidy Pool** | **10,000,000 WNX** (issued strictly via PoW mining) |
+| **Genesis Ecosystem Vault** | **2,100,000 WNX** (`WNX5B15097CB2203643C472AB992FA9FB1A`) |
+| **Max Supply Hard Cap** | **12,100,000 WNX** (`GenesisSupplySat + InitialPoolSat`) |
 | **Minimum Transfer Unit** | **0.00000001 WNX** (8 decimal places) |
 | **Reorganization Guard** | Max Reorg Depth: 10 blocks |
 

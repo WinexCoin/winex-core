@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -61,6 +63,14 @@ func main() {
 
 	dataPath := filepath.Join(getHomeDataDir(), "chain.state.json")
 	engine := consensus.NewNodeEngine(dataPath, seeds)
+
+	walletPath := filepath.Join(getHomeDataDir(), "node_wallet.json")
+	if nodeWallet, err := consensus.NewNodeWallet(walletPath); err == nil {
+		engine.SetWallet(nodeWallet)
+		log.Printf("==> Exchange Hot-Wallet subsystem initialized: %s (%d keys loaded)", walletPath, len(nodeWallet.GetAddresses()))
+	} else {
+		log.Printf("==> Warning: Could not initialize node hot-wallet: %v", err)
+	}
 
 	// Autonomous Decentralized NAT Traversal & Auto-Discovery
 	TryAutoUPnP(*port)
@@ -136,13 +146,201 @@ func main() {
 			} else {
 				rpcOK(consensus.GenesisHash)
 			}
+		case "getblockhash":
+			if len(req.Params) == 0 {
+				rpcErr(-32602, "Missing height parameter")
+				return
+			}
+			ref := fmt.Sprintf("%v", req.Params[0])
+			blk, _ := engine.GetBlockByHashOrHeight(ref)
+			if blk == nil {
+				rpcErr(-5, "Block height out of range")
+				return
+			}
+			rpcOK(blk.Hash)
+		case "getblock":
+			if len(req.Params) == 0 {
+				rpcErr(-32602, "Missing block hash or height parameter")
+				return
+			}
+			ref := fmt.Sprintf("%v", req.Params[0])
+			blk, confs := engine.GetBlockByHashOrHeight(ref)
+			if blk == nil {
+				rpcErr(-5, "Block not found")
+				return
+			}
+			rpcOK(map[string]interface{}{
+				"hash":          blk.Hash,
+				"confirmations": confs,
+				"size":          blk.TxCount*250 + 80,
+				"height":        blk.Index,
+				"version":       1,
+				"merkleroot":    blk.MerkleRoot,
+				"tx":            blk.Txs,
+				"time":          int64(blk.Timestamp),
+				"nonce":         blk.Nonce,
+				"difficulty":    blk.Difficulty,
+				"previousblockhash": blk.PrevHash,
+				"miner":         blk.Miner,
+			})
+		case "gettransaction", "getrawtransaction":
+			if len(req.Params) == 0 {
+				rpcErr(-32602, "Missing tx_id parameter")
+				return
+			}
+			txID := fmt.Sprintf("%v", req.Params[0])
+			txData, ok := engine.GetTransactionByID(txID)
+			if !ok {
+				rpcErr(-5, "No such mempool or blockchain transaction")
+				return
+			}
+			rpcOK(txData)
 		case "getbalance":
+			if len(req.Params) == 0 {
+				// Exchange hot-wallet balance across all managed addresses
+				w := engine.GetWallet()
+				if w == nil {
+					rpcOK(0.0)
+					return
+				}
+				var totalSat int64
+				for _, a := range w.GetAddresses() {
+					totalSat += engine.GetBalanceLocked(a)
+				}
+				rpcOK(float64(totalSat) / float64(consensus.SatoshiPerCoin))
+				return
+			}
+			addr := strings.TrimSpace(fmt.Sprintf("%v", req.Params[0]))
+			bal := engine.GetBalance(addr)
+			rpcOK(bal["balance"])
+		case "getaddressbalance":
 			if len(req.Params) == 0 {
 				rpcErr(-32602, "Missing address parameter")
 				return
 			}
 			addr := strings.TrimSpace(fmt.Sprintf("%v", req.Params[0]))
 			rpcOK(engine.GetBalance(addr))
+		case "getnewaddress":
+			w := engine.GetWallet()
+			if w == nil {
+				rpcErr(-32603, "Hot-wallet subsystem not active on this node")
+				return
+			}
+			label := ""
+			if len(req.Params) > 0 {
+				label = fmt.Sprintf("%v", req.Params[0])
+			}
+			newAddr, err := w.GenerateNewAddress(label)
+			if err != nil {
+				rpcErr(-32603, fmt.Sprintf("Failed to generate new address: %v", err))
+				return
+			}
+			rpcOK(newAddr)
+		case "sendtoaddress":
+			if len(req.Params) < 2 {
+				rpcErr(-32602, "Usage: sendtoaddress <address> <amount> [fee] [comment]")
+				return
+			}
+			toAddr := strings.TrimSpace(fmt.Sprintf("%v", req.Params[0]))
+			amtFloat := 0.0
+			switch v := req.Params[1].(type) {
+			case float64:
+				amtFloat = v
+			case int:
+				amtFloat = float64(v)
+			case int64:
+				amtFloat = float64(v)
+			case string:
+				_, _ = fmt.Sscanf(v, "%f", &amtFloat)
+			}
+			if amtFloat <= 0 {
+				rpcErr(-3, "Invalid amount for sendtoaddress")
+				return
+			}
+			amountSat := int64(math.Round(amtFloat * float64(consensus.SatoshiPerCoin)))
+			feeSat := int64(0)
+			if len(req.Params) > 2 {
+				if f, ok := req.Params[2].(float64); ok && f > 0 {
+					feeSat = int64(math.Round(f * float64(consensus.SatoshiPerCoin)))
+				}
+			}
+
+			txID, err := engine.SendFromWallet("", toAddr, amountSat, feeSat)
+			if err != nil {
+				rpcErr(-25, err.Error())
+				return
+			}
+			rpcOK(txID)
+		case "sendfrom":
+			if len(req.Params) < 3 {
+				rpcErr(-32602, "Usage: sendfrom <from_address> <to_address> <amount> [fee]")
+				return
+			}
+			fromAddr := strings.TrimSpace(fmt.Sprintf("%v", req.Params[0]))
+			toAddr := strings.TrimSpace(fmt.Sprintf("%v", req.Params[1]))
+			amtFloat := 0.0
+			switch v := req.Params[2].(type) {
+			case float64:
+				amtFloat = v
+			case int:
+				amtFloat = float64(v)
+			case string:
+				_, _ = fmt.Sscanf(v, "%f", &amtFloat)
+			}
+			amountSat := int64(math.Round(amtFloat * float64(consensus.SatoshiPerCoin)))
+			feeSat := int64(0)
+			if len(req.Params) > 3 {
+				if f, ok := req.Params[3].(float64); ok && f > 0 {
+					feeSat = int64(math.Round(f * float64(consensus.SatoshiPerCoin)))
+				}
+			}
+			txID, err := engine.SendFromWallet(fromAddr, toAddr, amountSat, feeSat)
+			if err != nil {
+				rpcErr(-25, err.Error())
+				return
+			}
+			rpcOK(txID)
+		case "getreceivedbyaddress":
+			if len(req.Params) == 0 {
+				rpcErr(-32602, "Missing address parameter")
+				return
+			}
+			addr := strings.TrimSpace(fmt.Sprintf("%v", req.Params[0]))
+			minConf := int64(1)
+			if len(req.Params) > 1 {
+				if mc, ok := req.Params[1].(float64); ok {
+					minConf = int64(mc)
+				}
+			}
+			coins, _ := engine.GetReceivedByAddress(addr, minConf)
+			rpcOK(coins)
+		case "listtransactions":
+			limit := 50
+			addr := ""
+			if len(req.Params) > 0 {
+				p0 := fmt.Sprintf("%v", req.Params[0])
+				if consensus.ValidateAddress(p0) {
+					addr = p0
+				}
+			}
+			if len(req.Params) > 1 {
+				if l, ok := req.Params[1].(float64); ok && l > 0 {
+					limit = int(l)
+				}
+			}
+			if addr != "" {
+				rpcOK(engine.GetAddressTransactions(addr, limit))
+			} else {
+				// Collect for all wallet addresses
+				w := engine.GetWallet()
+				var allTx []map[string]interface{}
+				if w != nil {
+					for _, a := range w.GetAddresses() {
+						allTx = append(allTx, engine.GetAddressTransactions(a, limit)...)
+					}
+				}
+				rpcOK(allTx)
+			}
 		case "validateaddress":
 			if len(req.Params) == 0 {
 				rpcErr(-32602, "Missing address parameter")
@@ -150,11 +348,18 @@ func main() {
 			}
 			addr := strings.TrimSpace(fmt.Sprintf("%v", req.Params[0]))
 			valid := consensus.ValidateAddress(addr)
-			rpcOK(map[string]interface{}{"isvalid": valid, "address": addr})
+			isMine := false
+			if w := engine.GetWallet(); w != nil {
+				isMine = w.HasAddress(addr)
+			}
+			rpcOK(map[string]interface{}{"isvalid": valid, "address": addr, "ismine": isMine})
 		case "getmininginfo":
 			rpcOK(engine.GetMiningTemplate())
 		case "getnetworkinfo", "getinfo":
 			rpcOK(engine.GetStatus())
+		case "getpeerinfo":
+			st := engine.GetStatus()
+			rpcOK(st["peers"])
 		default:
 			rpcErr(-32601, "Method not found or unsupported")
 		}
